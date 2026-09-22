@@ -1,0 +1,792 @@
+// 通院・美容院ノート（iPhone 版・データは端末内に保存）
+import { openStore, api, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pad = (n) => String(n).padStart(2, '0');
+const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const DOW = ['日', '月', '火', '水', '木', '金', '土'];
+const todayStr = () => ymd(new Date());
+function fmtDate(s, withDow = true) {
+  const [y, m, d] = s.split('-').map(Number);
+  const dow = DOW[new Date(y, m - 1, d).getDay()];
+  return `${m}/${d}${withDow ? `（${dow}）` : ''}`;
+}
+function fmtLongDate(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return `${y}年${m}月${d}日（${DOW[new Date(y, m - 1, d).getDay()]}）`;
+}
+const safeUrl = (u) => (/^https?:\/\//i.test(u) ? u : u ? `https://${u}` : '');
+
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (t.hidden = true), 2200);
+}
+
+// ---------------- 状態 ----------------
+const state = {
+  tab: 'calendar',
+  month: (() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); })(),
+  selected: todayStr(),
+  filter: new Set(), // 空 = すべて
+  categories: [],
+  places: [],
+  medicines: [],
+  masterSeg: 'places',
+  listQuery: '',
+  listPast: false,
+};
+const catById = (id) => state.categories.find((c) => c.id === Number(id));
+
+async function loadMasters() {
+  [state.categories, state.places, state.medicines] = await Promise.all([
+    api('/api/categories'), api('/api/places'), api('/api/medicines'),
+  ]);
+}
+
+// ---------------- 画像の縮小（通信量と容量の節約） ----------------
+async function shrinkImage(file, max = 1600) {
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.85));
+    return blob ? new File([blob], 'photo.jpg', { type: 'image/jpeg' }) : file;
+  } catch {
+    return file;
+  }
+}
+async function uploadPhotos(ownerType, ownerId, files) {
+  if (!files.length) return;
+  const fd = new FormData();
+  fd.append('owner_type', ownerType);
+  fd.append('owner_id', ownerId);
+  for (const f of files) fd.append('files', await shrinkImage(f));
+  await api('/api/photos', { method: 'POST', body: fd });
+}
+
+// 写真エディタ（既存 + 追加予定を管理）
+// st を渡すと、別シートへ移って戻ってきても追加予定の写真が保持される
+function photoEditor(container, existing = [], st = {}) {
+  st.pending ||= [];
+  st.removed ||= [];
+  const { pending, removed } = st;
+  let photos = existing.filter((p) => !removed.includes(p.id));
+  const render = () => {
+    container.innerHTML = `<div class="photos">
+      ${photos.map((p) => `<div class="photo"><img src="${photoUrl(p.filename)}" data-full="${photoUrl(p.filename)}" alt=""><button type="button" class="del" data-del="${p.id}" aria-label="削除">✕</button></div>`).join('')}
+      ${pending.map((p, i) => `<div class="photo pending"><img src="${p.url}" alt=""><button type="button" class="del" data-pdel="${i}" aria-label="取消">✕</button></div>`).join('')}
+      <label class="add-photo" title="写真を追加">＋<input type="file" accept="image/*" multiple hidden></label>
+    </div>`;
+    $('input[type=file]', container).addEventListener('change', (e) => {
+      for (const f of e.target.files) pending.push({ file: f, url: URL.createObjectURL(f) });
+      render();
+    });
+    $$('[data-del]', container).forEach((b) => b.addEventListener('click', () => {
+      removed.push(Number(b.dataset.del));
+      photos = photos.filter((p) => p.id !== Number(b.dataset.del));
+      render();
+    }));
+    $$('[data-pdel]', container).forEach((b) => b.addEventListener('click', () => {
+      pending.splice(Number(b.dataset.pdel), 1);
+      render();
+    }));
+  };
+  render();
+  return {
+    async commit(ownerType, ownerId) {
+      for (const id of removed) await api(`/api/photos/${id}`, { method: 'DELETE' });
+      await uploadPhotos(ownerType, ownerId, pending.map((p) => p.file));
+    },
+  };
+}
+function photoGrid(photos) {
+  if (!photos?.length) return '';
+  return `<div class="photos">${photos.map((p) => `<div class="photo"><img src="${photoUrl(p.filename)}" data-full="${photoUrl(p.filename)}" alt="" loading="lazy"></div>`).join('')}</div>`;
+}
+
+// ---------------- シート（モーダル） ----------------
+const sheetStack = [];
+function openSheet(render) {
+  sheetStack.push(render);
+  showSheet();
+}
+async function showSheet() {
+  const render = sheetStack.at(-1);
+  const sheet = $('#sheet');
+  if (!render) { closeAllSheets(); return; }
+  $('#sheet-backdrop').hidden = false;
+  sheet.hidden = false;
+  document.body.style.overflow = 'hidden';
+  await render(sheet);
+  sheet.scrollTop = 0;
+}
+function backSheet() {
+  sheetStack.pop();
+  showSheet();
+}
+function closeAllSheets() {
+  sheetStack.length = 0;
+  $('#sheet').hidden = true;
+  $('#sheet-backdrop').hidden = true;
+  $('#sheet').innerHTML = '';
+  document.body.style.overflow = '';
+}
+function sheetHead(title, extra = '') {
+  return `<div class="sheet-head">
+    <button type="button" class="icon-btn" data-back aria-label="戻る">${sheetStack.length > 1 ? '‹' : '✕'}</button>
+    <h1>${esc(title)}</h1>${extra}</div>`;
+}
+function bindHead(sheet) {
+  $('[data-back]', sheet)?.addEventListener('click', backSheet);
+}
+$('#sheet-backdrop').addEventListener('click', closeAllSheets);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { if (!$('#lightbox').hidden) $('#lightbox').hidden = true; else if (sheetStack.length) backSheet(); }
+});
+document.addEventListener('click', (e) => {
+  const img = e.target.closest('img[data-full]');
+  if (img) { $('img', $('#lightbox')).src = img.dataset.full; $('#lightbox').hidden = false; }
+});
+$('#lightbox').addEventListener('click', () => ($('#lightbox').hidden = true));
+
+async function refresh() {
+  await loadMasters();
+  await renderTab();
+}
+
+// ---------------- カレンダー ----------------
+async function renderCalendar(view) {
+  const m = state.month;
+  const first = new Date(m.getFullYear(), m.getMonth(), 1);
+  const start = new Date(first); start.setDate(1 - first.getDay());
+  const end = new Date(start); end.setDate(start.getDate() + 41);
+  const events = (await api(`/api/events?from=${ymd(start)}&to=${ymd(end)}`))
+    .filter((e) => !state.filter.size || state.filter.has(e.category_id));
+  const byDate = {};
+  for (const e of events) (byDate[e.date] ||= []).push(e);
+
+  const today = todayStr();
+  let cells = '';
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start); d.setDate(start.getDate() + i);
+    const ds = ymd(d);
+    const list = byDate[ds] || [];
+    const cls = ['cal-day', d.getMonth() !== m.getMonth() && 'other', ds === today && 'today', ds === state.selected && 'sel',
+      d.getDay() === 0 && 'sun', d.getDay() === 6 && 'sat'].filter(Boolean).join(' ');
+    cells += `<button class="${cls}" data-date="${ds}"><span class="num">${d.getDate()}</span>
+      ${list.slice(0, 3).map((e) => `<span class="pill ${e.done ? 'done' : ''}" style="--c:${esc(e.color)}">${esc(e.icon)}${esc(e.place_name || e.title || e.category_name)}</span>`).join('')}
+      ${list.length > 3 ? `<span class="more">+${list.length - 3}</span>` : ''}</button>`;
+    if (i === 34 && d >= new Date(m.getFullYear(), m.getMonth() + 1, 0)) break; // 5週で収まる月
+  }
+
+  const dayEvents = byDate[state.selected] || [];
+  view.innerHTML = `
+    <div class="cal-head">
+      <button class="icon-btn" data-nav="-1" aria-label="前の月">‹</button>
+      <h1>${m.getFullYear()}年${m.getMonth() + 1}月</h1>
+      <button class="icon-btn" data-nav="1" aria-label="次の月">›</button>
+      <button class="btn" data-today style="min-height:34px;padding:4px 10px">今日</button>
+    </div>
+    ${categoryChips()}
+    <div class="cal">
+      <div class="cal-grid">${DOW.map((w, i) => `<div class="cal-dow ${i === 0 ? 'sun' : i === 6 ? 'sat' : ''}">${w}</div>`).join('')}</div>
+      <div class="cal-grid">${cells}</div>
+    </div>
+    <h2>${fmtLongDate(state.selected)}</h2>
+    <div class="card">${dayEvents.length ? dayEvents.map(eventItem).join('') : '<div class="empty">予定はありません</div>'}</div>
+    <button class="fab" data-add aria-label="予定を追加">＋</button>`;
+
+  $$('[data-nav]', view).forEach((b) => b.addEventListener('click', () => {
+    state.month = new Date(m.getFullYear(), m.getMonth() + Number(b.dataset.nav), 1);
+    renderTab();
+  }));
+  $('[data-today]', view).addEventListener('click', () => {
+    const d = new Date();
+    state.month = new Date(d.getFullYear(), d.getMonth(), 1);
+    state.selected = todayStr();
+    renderTab();
+  });
+  $$('[data-date]', view).forEach((b) => b.addEventListener('click', () => {
+    const ds = b.dataset.date;
+    if (state.selected === ds && (byDate[ds] || []).length === 0) { openEventEdit(null, ds); return; }
+    state.selected = ds;
+    const [y, mo] = ds.split('-').map(Number);
+    if (mo - 1 !== m.getMonth()) state.month = new Date(y, mo - 1, 1);
+    renderTab();
+  }));
+  $('[data-add]', view).addEventListener('click', () => openEventEdit(null, state.selected));
+  bindChips(view);
+  bindEventItems(view);
+}
+
+function categoryChips() {
+  return `<div class="chips">
+    <button class="chip ${state.filter.size ? '' : 'on'}" data-chip="all">すべて</button>
+    ${state.categories.map((c) => `<button class="chip ${state.filter.has(c.id) ? 'on' : ''}" style="--c:${esc(c.color)}" data-chip="${c.id}"><span class="dot"></span>${esc(c.icon)} ${esc(c.name)}</button>`).join('')}
+  </div>`;
+}
+function bindChips(view) {
+  $$('[data-chip]', view).forEach((b) => b.addEventListener('click', () => {
+    const v = b.dataset.chip;
+    if (v === 'all') state.filter.clear();
+    else { const id = Number(v); state.filter.has(id) ? state.filter.delete(id) : state.filter.add(id); }
+    renderTab();
+  }));
+}
+function eventItem(e, showDate = false) {
+  const sub = [e.time, e.place_name, e.title && e.place_name ? e.title : '', e.medicine_count ? `💊${e.medicine_count}` : '', e.photo_count ? `📷${e.photo_count}` : '']
+    .filter(Boolean).join(' · ');
+  return `<button class="item ${e.done ? 'done' : ''}" data-event="${e.id}" style="--c:${esc(e.color)}">
+    <span class="bar"></span>
+    <span class="body"><div class="t">${esc(e.icon)} ${esc(e.title || e.place_name || e.category_name)}</div>
+    <div class="s">${esc(sub || e.category_name)}</div></span>
+    ${showDate ? `<span class="when">${fmtDate(e.date)}${e.done ? '<br>済' : ''}</span>` : ''}
+  </button>`;
+}
+function bindEventItems(view) {
+  $$('[data-event]', view).forEach((b) => b.addEventListener('click', () => openEventView(Number(b.dataset.event))));
+}
+
+// ---------------- 予定一覧 ----------------
+async function renderList(view) {
+  const q = state.listQuery;
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (!q) {
+    if (state.listPast) { params.set('to', todayStr()); params.set('order', 'desc'); params.set('limit', '300'); }
+    else params.set('from', todayStr());
+  } else params.set('order', 'desc');
+  const events = (await api(`/api/events?${params}`)).filter((e) => !state.filter.size || state.filter.has(e.category_id));
+  let html = '';
+  let lastMonth = '';
+  for (const e of events) {
+    const mo = e.date.slice(0, 7);
+    if (mo !== lastMonth) {
+      if (lastMonth) html += '</div>';
+      html += `<div class="month-label">${Number(mo.slice(0, 4))}年${Number(mo.slice(5))}月</div><div class="card">`;
+      lastMonth = mo;
+    }
+    html += eventItem(e, true);
+  }
+  if (lastMonth) html += '</div>';
+  view.innerHTML = `
+    <h1 style="margin-bottom:10px">予定一覧</h1>
+    <input class="search" type="search" placeholder="検索（病院名・薬名・メモ）" value="${esc(q)}">
+    ${q ? '' : `<div class="seg"><button data-past="0" class="${state.listPast ? '' : 'on'}">これから</button><button data-past="1" class="${state.listPast ? 'on' : ''}">過去の記録</button></div>`}
+    ${categoryChips()}
+    ${html || '<div class="card"><div class="empty">該当する予定はありません</div></div>'}
+    <button class="fab" data-add aria-label="予定を追加">＋</button>`;
+  const input = $('.search', view);
+  input.addEventListener('input', () => {
+    clearTimeout(renderList.t);
+    renderList.t = setTimeout(() => { state.listQuery = input.value.trim(); renderTab().then(() => { const i = $('.search'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300);
+  });
+  $$('[data-past]', view).forEach((b) => b.addEventListener('click', () => { state.listPast = b.dataset.past === '1'; renderTab(); }));
+  $('[data-add]', view).addEventListener('click', () => openEventEdit(null, todayStr()));
+  bindChips(view);
+  bindEventItems(view);
+}
+
+// ---------------- 予定の詳細 ----------------
+function openEventView(id) {
+  openSheet(async (sheet) => {
+    const e = await api(`/api/events/${id}`);
+    const p = e.place;
+    sheet.innerHTML = `${sheetHead(fmtLongDate(e.date), '<button class="btn" data-edit>編集</button>')}
+      <div style="--c:${esc(e.color)}"><span class="badge">${esc(e.icon)} ${esc(e.category_name)}</span> ${e.done ? '<span class="badge" style="--c:#78716c">済</span>' : ''}</div>
+      <h1 style="margin:8px 0 0;font-size:20px">${esc(e.title || e.place_name || e.category_name)}</h1>
+      <dl class="detail">
+        ${e.time ? `<dt>時刻</dt><dd class="pre">${esc(e.time)}</dd>` : ''}
+        ${p ? `<dt>病院・お店</dt><dd><a href="#" data-place="${p.id}">${esc(p.name)}</a>
+          ${p.url ? `<br><a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.url)}</a>` : ''}
+          ${p.phone ? `<br>📞 <a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>` : ''}
+          ${p.address ? `<br>📍 <a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a>` : ''}</dd>` : ''}
+        ${e.memo ? `<dt>メモ</dt><dd class="pre">${esc(e.memo)}</dd>` : ''}
+        ${e.medicines.length ? `<dt>薬</dt><dd><div class="box">${e.medicines.map((m) => `
+          <div class="med-row" data-med="${m.id}" style="cursor:pointer">
+            ${m.thumb ? `<img class="thumb" src="${photoUrl(m.thumb)}" alt="">` : '<span class="thumb" style="display:flex;align-items:center;justify-content:center">💊</span>'}
+            <div class="body"><b>${esc(m.name)}</b>${m.note ? ` <span class="muted small">${esc(m.note)}</span>` : ''}
+              ${m.efficacy ? `<div class="small muted">効能: ${esc(m.efficacy)}</div>` : ''}</div></div>`).join('')}</div></dd>` : ''}
+        ${e.photos.length ? `<dt>写真</dt><dd>${photoGrid(e.photos)}</dd>` : ''}
+      </dl>
+      <div class="actions">
+        <button class="btn" data-toggle>${e.done ? '未完了に戻す' : '✓ 完了にする'}</button>
+        <button class="btn" data-next>次回の予定を作成</button>
+      </div>`;
+    bindHead(sheet);
+    $('[data-edit]', sheet).addEventListener('click', () => openEventEdit(e));
+    $('[data-place]', sheet)?.addEventListener('click', (ev) => { ev.preventDefault(); openPlaceView(p.id); });
+    $$('[data-med]', sheet).forEach((r) => r.addEventListener('click', () => openMedicineView(Number(r.dataset.med))));
+    $('[data-toggle]', sheet).addEventListener('click', async () => {
+      await api(`/api/events/${e.id}`, { method: 'PUT', body: { ...e, done: !e.done, medicines: undefined } });
+      await renderTab();
+      showSheet();
+    });
+    $('[data-next]', sheet).addEventListener('click', () => {
+      openEventEdit({ category_id: e.category_id, place_id: e.place_id, title: e.title, date: '', time: e.time, memo: '', medicines: [], photos: [] }, null, true);
+    });
+  });
+}
+
+// ---------------- 予定の登録・編集 ----------------
+function openEventEdit(ev, date, isCopy = false) {
+  const isNew = !ev || isCopy;
+  const data = ev ? { ...ev } : { category_id: [...state.filter][0] || state.categories[0]?.id, place_id: null, date, time: '', title: '', memo: '', done: 0, medicines: [], photos: [] };
+  if (!data.date) data.date = date || todayStr();
+  let meds = (data.medicines || []).map((m) => ({ medicine_id: m.id, name: m.name, note: m.note || '' }));
+  const photoState = {};
+
+  openSheet(async (sheet) => {
+    sheet.innerHTML = `${sheetHead(isNew ? '予定を追加' : '予定を編集')}
+      <form>
+        <div class="field"><label>カテゴリ</label><div class="chips" data-cats style="flex-wrap:wrap">
+          ${state.categories.map((c) => `<button type="button" class="chip" style="--c:${esc(c.color)}" data-cat="${c.id}"><span class="dot"></span>${esc(c.icon)} ${esc(c.name)}</button>`).join('')}
+        </div></div>
+        <div class="field"><label>病院・お店</label>
+          <div class="row"><select name="place_id"></select><button type="button" class="btn" data-newplace style="flex:none">＋新規</button></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>日付</label><input type="date" name="date" required value="${esc(data.date)}"></div>
+          <div class="field"><label>時刻</label><input type="time" name="time" value="${esc(data.time)}"></div>
+        </div>
+        <div class="field"><label>内容（例: カット＋カラー、定期診察）</label><input name="title" value="${esc(data.title)}" autocomplete="off"></div>
+        <div class="field"><label>メモ</label><textarea name="memo" placeholder="症状、担当者、次回の目安、費用など">${esc(data.memo)}</textarea></div>
+        <div class="field"><label>薬</label><div class="box" data-meds></div></div>
+        <div class="field"><label>写真</label><div data-photos></div></div>
+        <label class="check"><input type="checkbox" name="done" ${data.done ? 'checked' : ''}> 完了（通院・来店済み）</label>
+        <div class="actions">
+          ${!isNew ? '<button type="button" class="btn danger" data-delete style="flex:0 0 auto">削除</button>' : ''}
+          <button class="btn primary">保存</button>
+        </div>
+      </form>`;
+    bindHead(sheet);
+    const form = $('form', sheet);
+    let catId = Number(data.category_id);
+
+    const renderCats = () => $$('[data-cat]', sheet).forEach((b) => b.classList.toggle('on', Number(b.dataset.cat) === catId));
+    const renderPlaces = () => {
+      const list = state.places.filter((p) => p.category_id === catId);
+      form.place_id.innerHTML = `<option value="">（未選択）</option>${list.map((p) => `<option value="${p.id}" ${p.id === Number(data.place_id) ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}`;
+    };
+    const renderMeds = () => {
+      const box = $('[data-meds]', sheet);
+      const opts = state.medicines.filter((m) => !meds.some((x) => x.medicine_id === m.id));
+      box.innerHTML = `${meds.map((m, i) => `<div class="med-row"><div class="body"><b>💊 ${esc(m.name)}</b>
+          <input placeholder="飲み方・日数など（例: 朝晩 14日分）" value="${esc(m.note)}" data-mnote="${i}" style="width:100%;margin-top:4px;border:1px solid var(--line);border-radius:8px;background:var(--bg)"></div>
+          <button type="button" class="icon-btn" data-mdel="${i}" aria-label="外す">✕</button></div>`).join('')}
+        <div class="row" style="margin-top:6px">
+          <select data-madd><option value="">登録済みの薬を追加…</option>${opts.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join('')}</select>
+          <button type="button" class="btn" data-mnew style="flex:none">＋新しい薬</button>
+        </div>`;
+      $$('[data-mnote]', box).forEach((inp) => inp.addEventListener('input', () => (meds[Number(inp.dataset.mnote)].note = inp.value)));
+      $$('[data-mdel]', box).forEach((b) => b.addEventListener('click', () => { meds.splice(Number(b.dataset.mdel), 1); renderMeds(); }));
+      $('[data-madd]', box).addEventListener('change', (e) => {
+        const m = state.medicines.find((x) => x.id === Number(e.target.value));
+        if (m) { meds.push({ medicine_id: m.id, name: m.name, note: '' }); renderMeds(); }
+      });
+      $('[data-mnew]', box).addEventListener('click', () => {
+        saveDraft();
+        openMedicineEdit({ category_id: catId, place_id: Number(form.place_id.value) || null }, (newId, name) => {
+          meds.push({ medicine_id: newId, name, note: '' });
+        });
+      });
+    };
+    // 別シートへ移る前に入力内容を保持
+    const saveDraft = () => {
+      Object.assign(data, { category_id: catId, place_id: Number(form.place_id.value) || null, date: form.date.value, time: form.time.value,
+        title: form.title.value, memo: form.memo.value, done: form.done.checked });
+    };
+
+    renderCats(); renderPlaces(); renderMeds();
+    const photos = photoEditor($('[data-photos]', sheet), isCopy ? [] : data.photos || [], photoState);
+
+    $$('[data-cat]', sheet).forEach((b) => b.addEventListener('click', () => {
+      catId = Number(b.dataset.cat); data.place_id = null; renderCats(); renderPlaces();
+    }));
+    $('[data-newplace]', sheet).addEventListener('click', () => {
+      saveDraft();
+      openPlaceEdit({ category_id: catId }, (newId) => { data.place_id = newId; });
+    });
+    $('[data-delete]', sheet)?.addEventListener('click', async () => {
+      if (!confirm('この予定を削除しますか？（写真も削除されます）')) return;
+      await api(`/api/events/${data.id}`, { method: 'DELETE' });
+      closeAllSheets(); toast('削除しました'); renderTab();
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      saveDraft();
+      const btn = $('.btn.primary', form);
+      btn.disabled = true; btn.textContent = '保存中…';
+      try {
+        const body = { ...data, medicines: meds };
+        let id = data.id;
+        if (isNew) id = (await api('/api/events', { method: 'POST', body })).id;
+        else await api(`/api/events/${id}`, { method: 'PUT', body });
+        await photos.commit('event', id);
+        state.selected = data.date;
+        const [y, m] = data.date.split('-').map(Number);
+        state.month = new Date(y, m - 1, 1);
+        closeAllSheets();
+        toast('保存しました');
+        await refresh();
+        openEventView(id);
+      } catch (err) {
+        alert(err.message);
+        btn.disabled = false; btn.textContent = '保存';
+      }
+    });
+  });
+}
+
+// ---------------- 病院・お店 ----------------
+function openPlaceView(id) {
+  openSheet(async (sheet) => {
+    const p = await api(`/api/places/${id}`);
+    const c = catById(p.category_id);
+    sheet.innerHTML = `${sheetHead(p.name, '<button class="btn" data-edit>編集</button>')}
+      ${c ? `<span class="badge" style="--c:${esc(c.color)}">${esc(c.icon)} ${esc(c.name)}</span>` : ''}
+      <dl class="detail">
+        ${p.url ? `<dt>URL</dt><dd><a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.url)}</a></dd>` : ''}
+        ${p.phone ? `<dt>電話</dt><dd><a href="tel:${esc(p.phone)}">${esc(p.phone)}</a></dd>` : ''}
+        ${p.address ? `<dt>住所</dt><dd><a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a></dd>` : ''}
+        ${p.memo ? `<dt>メモ</dt><dd class="pre">${esc(p.memo)}</dd>` : ''}
+        ${p.photos.length ? `<dt>写真</dt><dd>${photoGrid(p.photos)}</dd>` : ''}
+        ${p.medicines.length ? `<dt>この病院の薬</dt><dd>${p.medicines.map((m) => `<a href="#" data-med="${m.id}">💊 ${esc(m.name)}</a>`).join('<br>')}</dd>` : ''}
+        <dt>履歴</dt><dd>${p.events.length ? p.events.map((e) => `<a href="#" data-ev="${e.id}">${esc(e.date.replaceAll('-', '/'))}</a> ${esc(e.title)}${e.done ? '' : ' <span class="muted small">(予定)</span>'}`).join('<br>') : '<span class="muted">なし</span>'}</dd>
+      </dl>`;
+    bindHead(sheet);
+    $('[data-edit]', sheet).addEventListener('click', () => openPlaceEdit(p));
+    $$('[data-med]', sheet).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); openMedicineView(Number(a.dataset.med)); }));
+    $$('[data-ev]', sheet).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); openEventView(Number(a.dataset.ev)); }));
+  });
+}
+function openPlaceEdit(p, onCreated) {
+  const isNew = !p.id;
+  openSheet(async (sheet) => {
+    sheet.innerHTML = `${sheetHead(isNew ? '病院・お店を追加' : '病院・お店を編集')}
+      <form>
+        <div class="field"><label>カテゴリ</label><select name="category_id">${state.categories.map((c) => `<option value="${c.id}" ${c.id === Number(p.category_id) ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>名前</label><input name="name" required value="${esc(p.name)}" placeholder="例: ○○皮膚科クリニック"></div>
+        <div class="field"><label>URL（予約ページなど）</label><input name="url" type="url" inputmode="url" value="${esc(p.url)}" placeholder="https://"></div>
+        <div class="field"><label>電話番号</label><input name="phone" type="tel" value="${esc(p.phone)}"></div>
+        <div class="field"><label>住所</label><input name="address" value="${esc(p.address)}"></div>
+        <div class="field"><label>メモ</label><textarea name="memo" placeholder="診療時間、休診日、担当の先生・スタイリストなど">${esc(p.memo)}</textarea></div>
+        <div class="field"><label>写真（診察券・外観など）</label><div data-photos></div></div>
+        <div class="actions">
+          ${!isNew ? '<button type="button" class="btn danger" data-delete style="flex:0 0 auto">削除</button>' : ''}
+          <button class="btn primary">保存</button>
+        </div>
+      </form>`;
+    bindHead(sheet);
+    const form = $('form', sheet);
+    const photos = photoEditor($('[data-photos]', sheet), p.photos || []);
+    $('[data-delete]', sheet)?.addEventListener('click', async () => {
+      if (!confirm(`「${p.name}」を削除しますか？（予定は残り、病院の紐付けだけ外れます）`)) return;
+      await api(`/api/places/${p.id}`, { method: 'DELETE' });
+      await loadMasters();
+      sheetStack.length = 0; closeAllSheets(); toast('削除しました'); renderTab();
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = Object.fromEntries(new FormData(form));
+      try {
+        let id = p.id;
+        if (isNew) id = (await api('/api/places', { method: 'POST', body })).id;
+        else await api(`/api/places/${id}`, { method: 'PUT', body });
+        await photos.commit('place', id);
+        await loadMasters();
+        onCreated?.(id);
+        toast('保存しました');
+        backSheet();
+        if (state.tab === 'master') renderTab();
+      } catch (err) { alert(err.message); }
+    });
+  });
+}
+
+// ---------------- 薬 ----------------
+function openMedicineView(id) {
+  openSheet(async (sheet) => {
+    const m = await api(`/api/medicines/${id}`);
+    sheet.innerHTML = `${sheetHead(m.name, '<button class="btn" data-edit>編集</button>')}
+      <dl class="detail">
+        ${m.photos.length ? `<dt>写真</dt><dd>${photoGrid(m.photos)}</dd>` : ''}
+        ${m.efficacy ? `<dt>効能</dt><dd class="pre">${esc(m.efficacy)}</dd>` : ''}
+        ${m.usage ? `<dt>使い方・飲み方</dt><dd class="pre">${esc(m.usage)}</dd>` : ''}
+        ${m.place_name ? `<dt>処方元</dt><dd><a href="#" data-place="${m.place_id}">${esc(m.place_name)}</a></dd>` : ''}
+        ${m.memo ? `<dt>メモ</dt><dd class="pre">${esc(m.memo)}</dd>` : ''}
+        <dt>処方の履歴</dt><dd>${m.events.length ? m.events.map((e) => `<a href="#" data-ev="${e.id}">${esc(e.date.replaceAll('-', '/'))}</a> ${esc(e.note || e.title)}`).join('<br>') : '<span class="muted">なし</span>'}</dd>
+      </dl>`;
+    bindHead(sheet);
+    $('[data-edit]', sheet).addEventListener('click', () => openMedicineEdit(m));
+    $('[data-place]', sheet)?.addEventListener('click', (e) => { e.preventDefault(); openPlaceView(m.place_id); });
+    $$('[data-ev]', sheet).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); openEventView(Number(a.dataset.ev)); }));
+  });
+}
+function openMedicineEdit(m, onCreated) {
+  const isNew = !m.id;
+  openSheet(async (sheet) => {
+    sheet.innerHTML = `${sheetHead(isNew ? '薬を追加' : '薬を編集')}
+      <form>
+        <div class="field"><label>薬の名前</label><input name="name" required value="${esc(m.name)}" placeholder="例: ヒルドイドソフト軟膏"></div>
+        <div class="field"><label>写真</label><div data-photos></div></div>
+        <div class="field"><label>効能</label><textarea name="efficacy" style="min-height:60px" placeholder="例: 保湿、乾燥肌の改善">${esc(m.efficacy)}</textarea></div>
+        <div class="field"><label>使い方・飲み方</label><input name="usage" value="${esc(m.usage)}" placeholder="例: 1日2回 患部に塗る"></div>
+        <div class="row">
+          <div class="field"><label>カテゴリ</label><select name="category_id"><option value="">（なし）</option>${state.categories.map((c) => `<option value="${c.id}" ${c.id === Number(m.category_id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></div>
+          <div class="field"><label>処方元</label><select name="place_id"><option value="">（なし）</option>${state.places.map((p) => `<option value="${p.id}" ${p.id === Number(m.place_id) ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+        </div>
+        <div class="field"><label>メモ</label><textarea name="memo" placeholder="副作用、ジェネリック名、残量など">${esc(m.memo)}</textarea></div>
+        <div class="actions">
+          ${!isNew ? '<button type="button" class="btn danger" data-delete style="flex:0 0 auto">削除</button>' : ''}
+          <button class="btn primary">保存</button>
+        </div>
+      </form>`;
+    bindHead(sheet);
+    const form = $('form', sheet);
+    const photos = photoEditor($('[data-photos]', sheet), m.photos || []);
+    $('[data-delete]', sheet)?.addEventListener('click', async () => {
+      if (!confirm(`「${m.name}」を削除しますか？（予定からも外れます）`)) return;
+      await api(`/api/medicines/${m.id}`, { method: 'DELETE' });
+      await loadMasters();
+      closeAllSheets(); toast('削除しました'); renderTab();
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = Object.fromEntries(new FormData(form));
+      try {
+        let id = m.id;
+        if (isNew) id = (await api('/api/medicines', { method: 'POST', body })).id;
+        else await api(`/api/medicines/${id}`, { method: 'PUT', body });
+        await photos.commit('medicine', id);
+        await loadMasters();
+        onCreated?.(id, body.name);
+        toast('保存しました');
+        backSheet();
+        if (state.tab === 'master') renderTab();
+      } catch (err) { alert(err.message); }
+    });
+  });
+}
+
+// ---------------- カテゴリ ----------------
+function openCategoryEdit(c = {}) {
+  const isNew = !c.id;
+  openSheet(async (sheet) => {
+    sheet.innerHTML = `${sheetHead(isNew ? 'カテゴリを追加' : 'カテゴリを編集')}
+      <form>
+        <div class="field"><label>名前</label><input name="name" required value="${esc(c.name)}" placeholder="例: 病院（眼科）"></div>
+        <div class="row">
+          <div class="field"><label>アイコン（絵文字）</label><input name="icon" value="${esc(c.icon)}" maxlength="4" placeholder="🏥"></div>
+          <div class="field"><label>色</label><input name="color" type="color" value="${esc(c.color || '#0f766e')}" style="width:100%;height:44px;border:0;background:none"></div>
+        </div>
+        <div class="actions">
+          ${!isNew ? '<button type="button" class="btn danger" data-delete style="flex:0 0 auto">削除</button>' : ''}
+          <button class="btn primary">保存</button>
+        </div>
+      </form>`;
+    bindHead(sheet);
+    const form = $('form', sheet);
+    $('[data-delete]', sheet)?.addEventListener('click', async () => {
+      if (!confirm(`カテゴリ「${c.name}」を削除すると、その中の予定・病院/お店もすべて削除されます。よろしいですか？`)) return;
+      await api(`/api/categories/${c.id}`, { method: 'DELETE' });
+      state.filter.delete(c.id);
+      closeAllSheets(); toast('削除しました'); refresh();
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = Object.fromEntries(new FormData(form));
+      try {
+        if (isNew) await api('/api/categories', { method: 'POST', body });
+        else await api(`/api/categories/${c.id}`, { method: 'PUT', body });
+        closeAllSheets(); toast('保存しました'); refresh();
+      } catch (err) { alert(err.message); }
+    });
+  });
+}
+
+// ---------------- 登録情報タブ ----------------
+async function renderMaster(view) {
+  const seg = state.masterSeg;
+  let body = '';
+  if (seg === 'places') {
+    body = state.categories.map((c) => {
+      const list = state.places.filter((p) => p.category_id === c.id);
+      return `<div class="month-label"><span class="dot" style="--c:${esc(c.color)}"></span>${esc(c.icon)} ${esc(c.name)}</div>
+        <div class="card">${list.map((p) => `<button class="item" data-place="${p.id}" style="--c:${esc(c.color)}"><span class="bar"></span>
+          <span class="body"><div class="t">${esc(p.name)}</div><div class="s">${esc([p.phone, p.url].filter(Boolean).join(' · ') || p.memo)}</div></span></button>`).join('')
+          || '<div class="empty small">未登録</div>'}</div>`;
+    }).join('');
+  } else if (seg === 'medicines') {
+    body = `<div class="card">${state.medicines.map((m) => `<button class="item" data-med="${m.id}">
+      ${m.thumb ? `<img class="thumb" src="${photoUrl(m.thumb)}" alt="" loading="lazy">` : '<span class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:22px">💊</span>'}
+      <span class="body"><div class="t">${esc(m.name)}</div><div class="s">${esc(m.efficacy || m.place_name || '')}</div></span></button>`).join('')
+      || '<div class="empty">薬は未登録です</div>'}</div>`;
+  } else {
+    body = `<div class="card">${state.categories.map((c) => `<button class="item" data-cat="${c.id}" style="--c:${esc(c.color)}"><span class="bar"></span>
+      <span class="body"><div class="t">${esc(c.icon)} ${esc(c.name)}</div></span></button>`).join('')}</div>`;
+  }
+  view.innerHTML = `<h1 style="margin-bottom:10px">登録情報</h1>
+    <div class="seg">
+      <button data-seg="places" class="${seg === 'places' ? 'on' : ''}">病院・お店</button>
+      <button data-seg="medicines" class="${seg === 'medicines' ? 'on' : ''}">薬</button>
+      <button data-seg="categories" class="${seg === 'categories' ? 'on' : ''}">カテゴリ</button>
+    </div>
+    ${body}
+    <button class="fab" data-add aria-label="追加">＋</button>`;
+  $$('[data-seg]', view).forEach((b) => b.addEventListener('click', () => { state.masterSeg = b.dataset.seg; renderTab(); }));
+  $$('[data-place]', view).forEach((b) => b.addEventListener('click', () => openPlaceView(Number(b.dataset.place))));
+  $$('[data-med]', view).forEach((b) => b.addEventListener('click', () => openMedicineView(Number(b.dataset.med))));
+  $$('[data-cat]', view).forEach((b) => b.addEventListener('click', () => openCategoryEdit(catById(b.dataset.cat))));
+  $('[data-add]', view).addEventListener('click', () => {
+    if (seg === 'places') openPlaceEdit({ category_id: [...state.filter][0] || state.categories[0]?.id });
+    else if (seg === 'medicines') openMedicineEdit({});
+    else openCategoryEdit();
+  });
+}
+
+// ---------------- バックアップ ----------------
+const DAY = 86400 * 1000;
+const remindDays = () => getMeta('remind_days') || 7;
+function daysSinceBackup() {
+  const last = getMeta('last_backup');
+  return last ? Math.floor((Date.now() - new Date(last).getTime()) / DAY) : null;
+}
+function backupDue() {
+  const s = stats();
+  if (!s.events && !s.places && !s.medicines) return false;
+  const d = daysSinceBackup();
+  return d === null || d >= remindDays();
+}
+function backupBanner() {
+  if (!backupDue()) return '';
+  const d = daysSinceBackup();
+  return `<div class="box" style="border-color:var(--danger);margin-bottom:12px;display:flex;gap:8px;align-items:center">
+    <span style="flex:1">⚠️ ${d === null ? 'まだバックアップしていません' : `前回のバックアップから${d}日たちました`}</span>
+    <button class="btn primary" data-gobackup style="flex:none">バックアップ</button></div>`;
+}
+function goSettings() {
+  state.tab = 'settings';
+  $$('.tabbar button').forEach((x) => x.classList.toggle('active', x.dataset.tab === 'settings'));
+  window.scrollTo(0, 0);
+  renderTab();
+}
+
+// ---------------- 設定タブ ----------------
+async function renderSettings(view) {
+  const s = stats();
+  const last = getMeta('last_backup');
+  const est = await navigator.storage?.estimate?.().catch(() => null);
+  const persisted = await navigator.storage?.persisted?.().catch(() => false);
+  const fmtSize = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`);
+  view.innerHTML = `<h1 style="margin-bottom:10px">設定</h1>
+    <h2>バックアップ</h2>
+    <div class="box">
+      <dl class="detail" style="margin:0">
+        <dt>前回のバックアップ</dt><dd>${last ? `${new Date(last).toLocaleString('ja-JP')}（${daysSinceBackup()}日前）` : 'まだありません'}</dd>
+        <dt>お知らせの間隔</dt><dd><select data-remind style="padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:var(--card)">
+          ${[3, 7, 14, 30].map((n) => `<option value="${n}" ${n === remindDays() ? 'selected' : ''}>${n}日ごと</option>`).join('')}</select></dd>
+      </dl>
+      <p class="small muted">「バックアップを作成」→「保存先を選ぶ」で共有メニューが開きます。<b>Google ドライブ</b>（アプリ）または「ファイルに保存」→ Google ドライブ を選んでください。</p>
+      <div class="actions" style="flex-direction:column">
+        <button class="btn primary" data-make>バックアップを作成</button>
+        <button class="btn primary" data-share hidden>保存先を選ぶ</button>
+      </div>
+    </div>
+    <h2>復元</h2>
+    <div class="box">
+      <p class="small muted" style="margin-top:0">バックアップファイル（.json）を選ぶと、<b>今のデータをすべて置き換えて</b>復元します。PC版からの移行にも使えます。</p>
+      <label class="btn block" style="display:flex;align-items:center;justify-content:center">バックアップファイルを選ぶ<input type="file" accept=".json,application/json" data-import hidden></label>
+    </div>
+    <h2>このアプリについて</h2>
+    <div class="box small">
+      データはこの iPhone の中だけに保存されます（予定 ${s.events}件・病院/お店 ${s.places}件・薬 ${s.medicines}件・写真 ${s.photos}枚${est?.usage ? `、約${fmtSize(est.usage)}` : ''}）。<br>
+      ${persisted ? '保存領域は「永続」に設定されています。' : ''}
+      ホーム画面からこのアプリを削除すると、データも消えます。定期的にバックアップしてください。
+    </div>`;
+
+  $('[data-remind]', view).addEventListener('change', async (e) => { await setMeta('remind_days', Number(e.target.value)); toast('変更しました'); });
+
+  let file = null;
+  const shareBtn = $('[data-share]', view);
+  $('[data-make]', view).addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = '作成中…';
+    try {
+      file = await exportBackup();
+      shareBtn.hidden = false;
+      e.target.textContent = `作成しました（${fmtSize(file.size)}）`;
+    } catch (err) {
+      alert(err.message);
+      e.target.disabled = false; e.target.textContent = 'バックアップを作成';
+    }
+  });
+  // iOS の共有はタップ直後に呼ぶ必要があるので、作成とは別のボタンにしている
+  shareBtn.addEventListener('click', async () => {
+    if (!file) return;
+    try {
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: file.name });
+      } else {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(file);
+        a.download = file.name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      }
+      await setMeta('last_backup', new Date().toISOString());
+      toast('バックアップしました');
+      renderTab();
+    } catch (err) {
+      if (err.name !== 'AbortError') alert(err.message);
+    }
+  });
+
+  $('[data-import]', view).addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    if (!confirm(`「${f.name}」から復元します。今のデータはすべて置き換わります。よろしいですか？`)) return;
+    try {
+      const r = await importBackup(f);
+      await setMeta('last_backup', new Date().toISOString());
+      toast(`復元しました（予定 ${r.events}件・写真 ${r.photos}枚）`);
+      await refresh();
+    } catch (err) { alert(`復元できませんでした: ${err.message}`); }
+  });
+}
+
+// ---------------- タブ切替 ----------------
+const renderers = { calendar: renderCalendar, list: renderList, master: renderMaster, settings: renderSettings };
+async function renderTab() {
+  const view = $('#view');
+  try {
+    await renderers[state.tab](view);
+    if (state.tab === 'calendar' || state.tab === 'list') {
+      view.insertAdjacentHTML('afterbegin', backupBanner());
+      $('[data-gobackup]', view)?.addEventListener('click', goSettings);
+    }
+  } catch (err) {
+    view.innerHTML = `<div class="empty">読み込みに失敗しました: ${esc(err.message)}</div>`;
+  }
+}
+$$('.tabbar button').forEach((b) => b.addEventListener('click', () => {
+  state.tab = b.dataset.tab;
+  $$('.tabbar button').forEach((x) => x.classList.toggle('active', x === b));
+  window.scrollTo(0, 0);
+  renderTab();
+}));
+
+// オフラインでも開けるようにする
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+
+openStore().then(refresh).catch((err) => {
+  $('#view').innerHTML = `<div class="empty">データを開けませんでした: ${esc(err.message)}<br>プライベートブラウズでは使えません。</div>`;
+});

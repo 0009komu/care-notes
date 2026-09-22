@@ -73,6 +73,19 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
   padding: 4px 12px; cursor: pointer; white-space: nowrap; font-size: 13px; min-height: 32px;
 }
 .chip.on { border-color: var(--c, var(--accent)); background: color-mix(in srgb, var(--c, var(--accent)) 16%, var(--card)); font-weight: 600; }
+.import-row { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.import-row:last-child { border-bottom: 0; }
+.import-row select { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-size: 14px; }
+.chip.add { border-style: dashed; color: var(--muted); }
+.icon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr)); gap: 6px; }
+.icon-opt {
+  aspect-ratio: 1; font-size: 24px; border: 2px solid var(--line); background: var(--card); border-radius: 10px;
+  cursor: pointer; padding: 0; min-height: 44px;
+}
+.icon-opt.on { border-color: var(--accent); background: var(--accent-soft); }
+.color-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.color-opt { width: 36px; height: 36px; border-radius: 50%; border: 3px solid var(--card); background: var(--c); cursor: pointer; box-shadow: 0 0 0 1px var(--line); }
+.color-opt.on { box-shadow: 0 0 0 3px var(--text); }
 .chip .dot, .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--c); margin-right: 5px; vertical-align: 1px; }
 
 /* calendar */

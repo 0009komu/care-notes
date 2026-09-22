@@ -235,6 +235,8 @@ route('DELETE', '/api/medicines/:id', async ([id]) => {
 });
 
 // 予定
+// カレンダーから取り込み済みの予定（重複取り込みの防止用）
+route('GET', '/api/ext-ids', () => mem.events.map((e) => e.ext_id).filter(Boolean));
 route('GET', '/api/events', (_, __, q) => {
   const from = q.get('from'), to = q.get('to'), cat = q.get('category_id'), text = (q.get('q') || '').toLowerCase();
   let list = mem.events.filter((e) => (!from || e.date >= from) && (!to || e.date <= to) && (!cat || e.category_id === Number(cat)));
@@ -260,7 +262,7 @@ route('GET', '/api/events/:id', ([id]) => {
   };
 });
 function eventFields(b) {
-  const f = { category_id: Number(b.category_id), place_id: idOrNull(b.place_id), date: str(b.date), time: str(b.time), title: str(b.title), memo: str(b.memo), done: b.done ? 1 : 0 };
+  const f = { category_id: Number(b.category_id), place_id: idOrNull(b.place_id), date: str(b.date), time: str(b.time), title: str(b.title), memo: str(b.memo), done: b.done ? 1 : 0, ext_id: str(b.ext_id) };
   if (!f.category_id) bad('カテゴリを選んでください');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date)) bad('日付が正しくありません');
   return f;

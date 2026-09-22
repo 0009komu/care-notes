@@ -1,6 +1,6 @@
 // オフライン用キャッシュ。ファイルを更新したら VERSION を上げる
-const VERSION = 'v1';
-const FILES = ['./', './index.html', './app.js', './store.js', './style.css', './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
+const VERSION = 'v2';
+const FILES = ['./', './index.html', './app.js', './store.js', './import-cal.js', './style.css', './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));

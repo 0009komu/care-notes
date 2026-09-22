@@ -1,5 +1,6 @@
 // 通院・美容院ノート（iPhone 版・データは端末内に保存）
 import { openStore, api, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
+import { parseCalendarText, guessCategory } from './import-cal.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -231,9 +232,11 @@ function categoryChips() {
   return `<div class="chips">
     <button class="chip ${state.filter.size ? '' : 'on'}" data-chip="all">すべて</button>
     ${state.categories.map((c) => `<button class="chip ${state.filter.has(c.id) ? 'on' : ''}" style="--c:${esc(c.color)}" data-chip="${c.id}"><span class="dot"></span>${esc(c.icon)} ${esc(c.name)}</button>`).join('')}
+    <button class="chip add" data-addcat>＋ カテゴリ</button>
   </div>`;
 }
 function bindChips(view) {
+  $('[data-addcat]', view)?.addEventListener('click', () => openCategoryEdit());
   $$('[data-chip]', view).forEach((b) => b.addEventListener('click', () => {
     const v = b.dataset.chip;
     if (v === 'all') state.filter.clear();
@@ -349,6 +352,7 @@ function openEventEdit(ev, date, isCopy = false) {
       <form>
         <div class="field"><label>カテゴリ</label><div class="chips" data-cats style="flex-wrap:wrap">
           ${state.categories.map((c) => `<button type="button" class="chip" style="--c:${esc(c.color)}" data-cat="${c.id}"><span class="dot"></span>${esc(c.icon)} ${esc(c.name)}</button>`).join('')}
+          <button type="button" class="chip add" data-newcat>＋ 追加</button>
         </div></div>
         <div class="field"><label>病院・お店</label>
           <div class="row"><select name="place_id"></select><button type="button" class="btn" data-newplace style="flex:none">＋新規</button></div>
@@ -414,6 +418,10 @@ function openEventEdit(ev, date, isCopy = false) {
     $('[data-newplace]', sheet).addEventListener('click', () => {
       saveDraft();
       openPlaceEdit({ category_id: catId }, (newId) => { data.place_id = newId; });
+    });
+    $('[data-newcat]', sheet).addEventListener('click', () => {
+      saveDraft();
+      openCategoryEdit({}, (newId) => { data.category_id = newId; data.place_id = null; });
     });
     $('[data-delete]', sheet)?.addEventListener('click', async () => {
       if (!confirm('この予定を削除しますか？（写真も削除されます）')) return;
@@ -578,16 +586,28 @@ function openMedicineEdit(m, onCreated) {
 }
 
 // ---------------- カテゴリ ----------------
-function openCategoryEdit(c = {}) {
+const CATEGORY_ICONS = [
+  '🏥', '🩺', '💊', '💉', '🩹', '🦷', '👁️', '👂', '🧠', '❤️', '🫁', '🦴',
+  '🤰', '👶', '🧴', '🧪', '✂️', '💇', '💈', '💅', '💆', '🧖', '💄', '🪒',
+  '🏋️', '🧘', '🏊', '🐶', '🐱', '📋', '🌸', '⭐',
+];
+const CATEGORY_COLORS = ['#0f766e', '#2563eb', '#7c3aed', '#db2777', '#dc2626', '#ea580c', '#ca8a04', '#16a34a', '#0891b2', '#57534e'];
+
+function openCategoryEdit(c = {}, onCreated) {
   const isNew = !c.id;
+  let icon = c.icon || '🏥';
+  let color = c.color || CATEGORY_COLORS[state.categories.length % CATEGORY_COLORS.length];
   openSheet(async (sheet) => {
     sheet.innerHTML = `${sheetHead(isNew ? 'カテゴリを追加' : 'カテゴリを編集')}
       <form>
-        <div class="field"><label>名前</label><input name="name" required value="${esc(c.name)}" placeholder="例: 病院（眼科）"></div>
-        <div class="row">
-          <div class="field"><label>アイコン（絵文字）</label><input name="icon" value="${esc(c.icon)}" maxlength="4" placeholder="🏥"></div>
-          <div class="field"><label>色</label><input name="color" type="color" value="${esc(c.color || '#0f766e')}" style="width:100%;height:44px;border:0;background:none"></div>
-        </div>
+        <div class="field"><label>名前</label><input name="name" required value="${esc(c.name)}" placeholder="例: 病院（眼科）、整体、ネイル"></div>
+        <div class="field"><label>アイコン</label><div class="icon-grid" data-icons>
+          ${CATEGORY_ICONS.map((i) => `<button type="button" class="icon-opt" data-icon="${i}" aria-label="${i}">${i}</button>`).join('')}
+        </div></div>
+        <div class="field"><label>色</label><div class="color-grid" data-colors>
+          ${CATEGORY_COLORS.map((col) => `<button type="button" class="color-opt" data-color="${col}" style="--c:${col}" aria-label="色 ${col}"></button>`).join('')}
+        </div></div>
+        <div class="field"><label>表示の見本</label><div data-preview></div></div>
         <div class="actions">
           ${!isNew ? '<button type="button" class="btn danger" data-delete style="flex:0 0 auto">削除</button>' : ''}
           <button class="btn primary">保存</button>
@@ -595,6 +615,15 @@ function openCategoryEdit(c = {}) {
       </form>`;
     bindHead(sheet);
     const form = $('form', sheet);
+    const renderPicks = () => {
+      $$('[data-icon]', sheet).forEach((b) => b.classList.toggle('on', b.dataset.icon === icon));
+      $$('[data-color]', sheet).forEach((b) => b.classList.toggle('on', b.dataset.color === color));
+      $('[data-preview]', sheet).innerHTML = `<span class="chip on" style="--c:${esc(color)};display:inline-block"><span class="dot"></span>${esc(icon)} ${esc(form.name.value || 'カテゴリ名')}</span>`;
+    };
+    $$('[data-icon]', sheet).forEach((b) => b.addEventListener('click', () => { icon = b.dataset.icon; renderPicks(); }));
+    $$('[data-color]', sheet).forEach((b) => b.addEventListener('click', () => { color = b.dataset.color; renderPicks(); }));
+    form.name.addEventListener('input', renderPicks);
+    renderPicks();
     $('[data-delete]', sheet)?.addEventListener('click', async () => {
       if (!confirm(`カテゴリ「${c.name}」を削除すると、その中の予定・病院/お店もすべて削除されます。よろしいですか？`)) return;
       await api(`/api/categories/${c.id}`, { method: 'DELETE' });
@@ -603,11 +632,14 @@ function openCategoryEdit(c = {}) {
     });
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const body = Object.fromEntries(new FormData(form));
+      const body = { name: form.name.value, icon, color };
       try {
-        if (isNew) await api('/api/categories', { method: 'POST', body });
+        let id = c.id;
+        if (isNew) id = (await api('/api/categories', { method: 'POST', body })).id;
         else await api(`/api/categories/${c.id}`, { method: 'PUT', body });
-        closeAllSheets(); toast('保存しました'); refresh();
+        toast('保存しました');
+        if (onCreated) { await loadMasters(); onCreated(id); backSheet(); renderTab(); return; }
+        closeAllSheets(); refresh();
       } catch (err) { alert(err.message); }
     });
   });
@@ -680,6 +712,109 @@ function goSettings() {
   renderTab();
 }
 
+// ---------------- カレンダーの取り込み ----------------
+const SHORTCUT_HELP = `<ol class="small" style="padding-left:20px;margin:8px 0 0;line-height:1.7">
+  <li><b>ショートカット</b> App を開き、右上の「＋」を押す</li>
+  <li>「アクションを追加」で <b>カレンダーの予定を検索</b> を追加<br>
+    「フィルタを追加」→「開始日」「が次の期間内」→ たとえば「90 日」にする<br>
+    （「制限」はオフのまま）</li>
+  <li><b>各項目を繰り返す</b> を追加（入力は「カレンダーの予定」）</li>
+  <li>繰り返しの中に <b>テキスト</b> を追加し、次の4行を入れる<br>
+    1行目: <code>■</code> に続けて変数「繰り返し項目」→ タップして <b>開始日</b> を選ぶ<br>
+    2行目: 変数「繰り返し項目」→ <b>タイトル</b><br>
+    3行目: 変数「繰り返し項目」→ <b>場所</b><br>
+    4行目: 変数「繰り返し項目」→ <b>メモ</b></li>
+  <li>「繰り返しの終了」の下に <b>クリップボードにコピー</b> を追加（入力は「繰り返しの結果」）</li>
+  <li>名前を「通院ノートに送る」などにして完了</li>
+</ol>
+<p class="small muted">使うとき: ショートカットを実行 → このアプリを開いて「コピーした予定を貼り付け」。初回はカレンダーへのアクセス許可を聞かれます。</p>`;
+
+function openPasteSheet() {
+  openSheet(async (sheet) => {
+    sheet.innerHTML = `${sheetHead('予定を貼り付け')}
+      <p class="small muted" style="margin-top:0">ショートカットでコピーした内容を、下の欄を長押しして「ペースト」してください。</p>
+      <div class="field"><textarea data-text style="min-height:200px" placeholder="■2026/10/01 10:00&#10;皮膚科&#10;さくら皮膚科&#10;メモ"></textarea></div>
+      <div class="actions"><button class="btn primary" data-next>次へ</button></div>`;
+    bindHead(sheet);
+    $('[data-next]', sheet).addEventListener('click', () => {
+      const items = parseCalendarText($('[data-text]', sheet).value);
+      if (!items.length) { alert('予定が見つかりませんでした。ショートカットの作り方を確認してください。'); return; }
+      openCalendarImport(items);
+    });
+  });
+}
+
+async function openCalendarImport(all) {
+  if (!all.length) { alert('予定が見つかりませんでした。'); return; }
+  const imported = new Set(await api('/api/ext-ids'));
+  const seen = new Set();
+  const items = all.filter((it) => !imported.has(it.ext_id) && !seen.has(it.ext_id) && seen.add(it.ext_id))
+    .sort((a, b) => (a.date + a.time < b.date + b.time ? -1 : 1))
+    .map((it) => {
+      const g = guessCategory(it, state.categories, state.places);
+      return { ...it, ...g, checked: !!g.category_id };
+    });
+  const skipped = all.length - items.length;
+
+  openSheet(async (sheet) => {
+    const placeOptions = (it) => `<option value="">（病院・お店なし）</option>${state.places.filter((p) => p.category_id === it.category_id)
+      .map((p) => `<option value="${p.id}" ${p.id === it.place_id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}`;
+    const count = () => items.filter((it) => it.checked && it.category_id).length;
+    sheet.innerHTML = `${sheetHead('カレンダーから取り込む')}
+      <p class="small muted" style="margin-top:0">${items.length}件の予定が見つかりました${skipped ? `（取り込み済みなど ${skipped}件は除外）` : ''}。取り込む予定にチェックを入れ、カテゴリを選んでください。</p>
+      ${items.length ? `<div class="row" style="margin-bottom:8px"><button class="btn" data-all>すべて選択</button><button class="btn" data-none>すべて解除</button></div>` : ''}
+      <div class="card">${items.map((it, i) => `
+        <div class="import-row" data-row="${i}">
+          <label class="check" style="min-height:auto;align-items:flex-start">
+            <input type="checkbox" data-check ${it.checked ? 'checked' : ''}>
+            <span style="flex:1;min-width:0"><b>${esc(it.title || '（タイトルなし）')}</b><br>
+              <span class="small muted">${fmtDate(it.date)} ${esc(it.time)}${it.location ? ` · ${esc(it.location)}` : ''}</span></span>
+          </label>
+          <div class="row" style="margin-top:6px">
+            <select data-cat><option value="">カテゴリを選ぶ…</option>${state.categories.map((c) => `<option value="${c.id}" ${c.id === it.category_id ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select>
+            <select data-place>${placeOptions(it)}</select>
+          </div>
+        </div>`).join('') || '<div class="empty">新しく取り込める予定はありません</div>'}</div>
+      <div class="actions"><button class="btn primary" data-go ${count() ? '' : 'disabled'}>選んだ ${count()}件を取り込む</button></div>`;
+    bindHead(sheet);
+    const go = $('[data-go]', sheet);
+    const refreshCount = () => { const n = count(); go.disabled = !n; go.textContent = `選んだ ${n}件を取り込む`; };
+    $$('[data-row]', sheet).forEach((row) => {
+      const it = items[Number(row.dataset.row)];
+      $('[data-check]', row).addEventListener('change', (e) => { it.checked = e.target.checked; refreshCount(); });
+      $('[data-cat]', row).addEventListener('change', (e) => {
+        it.category_id = Number(e.target.value) || null;
+        it.place_id = null;
+        $('[data-place]', row).innerHTML = placeOptions(it);
+        if (it.category_id) { it.checked = true; $('[data-check]', row).checked = true; }
+        refreshCount();
+      });
+      $('[data-place]', row).addEventListener('change', (e) => { it.place_id = Number(e.target.value) || null; });
+    });
+    const setAll = (v) => { items.forEach((it) => (it.checked = v)); $$('[data-check]', sheet).forEach((c) => (c.checked = v)); refreshCount(); };
+    $('[data-all]', sheet)?.addEventListener('click', () => setAll(true));
+    $('[data-none]', sheet)?.addEventListener('click', () => setAll(false));
+    go.addEventListener('click', async () => {
+      const targets = items.filter((it) => it.checked && it.category_id);
+      if (items.some((it) => it.checked && !it.category_id) && !confirm('カテゴリを選んでいない予定は取り込まれません。続けますか？')) return;
+      go.disabled = true; go.textContent = '取り込み中…';
+      const today = todayStr();
+      for (const it of targets) {
+        const memo = [it.location && `場所: ${it.location}`, it.notes].filter(Boolean).join('\n');
+        await api('/api/events', { method: 'POST', body: {
+          category_id: it.category_id, place_id: it.place_id, date: it.date, time: it.time, title: it.title, memo,
+          done: it.date < today, ext_id: it.ext_id, medicines: [],
+        } });
+      }
+      closeAllSheets();
+      toast(`${targets.length}件を取り込みました`);
+      state.tab = 'calendar';
+      $$('.tabbar button').forEach((x) => x.classList.toggle('active', x.dataset.tab === 'calendar'));
+      await refresh();
+    });
+  });
+}
+
 // ---------------- 設定タブ ----------------
 async function renderSettings(view) {
   const s = stats();
@@ -700,6 +835,18 @@ async function renderSettings(view) {
         <button class="btn primary" data-make>バックアップを作成</button>
         <button class="btn primary" data-share hidden>保存先を選ぶ</button>
       </div>
+    </div>
+    <h2>iPhone のカレンダーから取り込む</h2>
+    <div class="box">
+      <p class="small muted" style="margin-top:0">ショートカット App でコピーした予定を貼り付けるか、カレンダーのファイル（.ics）を選びます。取り込む予定とカテゴリは次の画面で選べます。</p>
+      <div class="actions" style="flex-direction:column;margin-top:8px">
+        <button class="btn primary" data-paste>コピーした予定を貼り付け</button>
+        <label class="btn block" style="display:flex;align-items:center;justify-content:center">カレンダーのファイル（.ics）を選ぶ<input type="file" accept=".ics,text/calendar" data-ics hidden></label>
+      </div>
+      <details style="margin-top:10px">
+        <summary class="small" style="cursor:pointer;color:var(--accent)">ショートカットの作り方（最初に1回だけ）</summary>
+        ${SHORTCUT_HELP}
+      </details>
     </div>
     <h2>復元</h2>
     <div class="box">
@@ -747,6 +894,18 @@ async function renderSettings(view) {
     } catch (err) {
       if (err.name !== 'AbortError') alert(err.message);
     }
+  });
+
+  $('[data-paste]', view).addEventListener('click', async () => {
+    let text = '';
+    try { text = await navigator.clipboard.readText(); } catch { /* 許可されなかったら手で貼り付け */ }
+    if (text && /■|BEGIN:VCALENDAR/.test(text)) openCalendarImport(parseCalendarText(text));
+    else openPasteSheet();
+  });
+  $('[data-ics]', view).addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (f) openCalendarImport(parseCalendarText(await f.text()));
   });
 
   $('[data-import]', view).addEventListener('change', async (e) => {

@@ -1,6 +1,7 @@
 // 通院・美容院ノート（iPhone 版・データは端末内に保存）
 import { openStore, api, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
 import { parseCalendarText, guessCategory } from './import-cal.js';
+import { searchPlaces } from './places.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -478,11 +479,14 @@ function openPlaceView(id) {
 }
 function openPlaceEdit(p, onCreated) {
   const isNew = !p.id;
+  const photoState = {};
   openSheet(async (sheet) => {
     sheet.innerHTML = `${sheetHead(isNew ? '病院・お店を追加' : '病院・お店を編集')}
       <form>
         <div class="field"><label>カテゴリ</label><select name="category_id">${state.categories.map((c) => `<option value="${c.id}" ${c.id === Number(p.category_id) ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select></div>
-        <div class="field"><label>名前</label><input name="name" required value="${esc(p.name)}" placeholder="例: ○○皮膚科クリニック"></div>
+        <div class="field"><label>名前</label>
+          <div class="row"><input name="name" required value="${esc(p.name)}" placeholder="例: ○○皮膚科クリニック"><button type="button" class="btn" data-lookup style="flex:none">🔍 検索</button></div>
+          <div class="small muted" style="margin-top:4px">名前を入れて「検索」を押すと、Google から住所・URL・電話番号を入れられます</div></div>
         <div class="field"><label>URL（予約ページなど）</label><input name="url" type="url" inputmode="url" value="${esc(p.url)}" placeholder="https://"></div>
         <div class="field"><label>電話番号</label><input name="phone" type="tel" value="${esc(p.phone)}"></div>
         <div class="field"><label>住所</label><input name="address" value="${esc(p.address)}"></div>
@@ -495,7 +499,19 @@ function openPlaceEdit(p, onCreated) {
       </form>`;
     bindHead(sheet);
     const form = $('form', sheet);
-    const photos = photoEditor($('[data-photos]', sheet), p.photos || []);
+    const photos = photoEditor($('[data-photos]', sheet), p.photos || [], photoState);
+    $('[data-lookup]', sheet).addEventListener('click', () => {
+      // 入力中の内容を保持してから検索画面へ
+      Object.assign(p, Object.fromEntries(new FormData(form)));
+      if (!p.name.trim()) { alert('先に名前を入力してください'); return; }
+      openPlaceLookup(p.name.trim(), (hit) => {
+        Object.assign(p, {
+          address: hit.address || p.address,
+          url: hit.url || p.url,
+          phone: hit.phone || p.phone,
+        });
+      });
+    });
     $('[data-delete]', sheet)?.addEventListener('click', async () => {
       if (!confirm(`「${p.name}」を削除しますか？（予定は残り、病院の紐付けだけ外れます）`)) return;
       await api(`/api/places/${p.id}`, { method: 'DELETE' });
@@ -518,6 +534,54 @@ function openPlaceEdit(p, onCreated) {
       } catch (err) { alert(err.message); }
     });
   });
+}
+
+// 名前から Google で住所・URL・電話番号を探す
+function openPlaceLookup(initialQuery, onPick) {
+  let query = initialQuery;
+  let results = null;
+  let error = '';
+  const self = async (sheet) => {
+    const key = getMeta('places_key');
+    const mapsSearch = `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
+    const render = () => {
+      sheet.innerHTML = `${sheetHead('Google で検索')}
+        <form data-q class="row" style="margin-bottom:10px">
+          <input name="q" value="${esc(query)}" placeholder="名前（地名を足すと絞り込めます）" style="padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:16px">
+          <button class="btn primary" style="flex:none">検索</button>
+        </form>
+        ${!key ? `<div class="box small">Google の場所検索を使うには、「設定」で API キーを登録してください。<br>
+            いまは下のボタンから Google マップで探して、住所などをコピーできます。</div>`
+          : error ? `<div class="box small" style="border-color:var(--danger)">⚠️ ${esc(error)}</div>`
+          : !results ? '<div class="empty">検索中…</div>'
+          : `<div class="card">${results.map((r, i) => `<button class="item" data-pick="${i}" style="align-items:flex-start">
+              <span class="body"><div class="t" style="white-space:normal">${esc(r.name)}</div>
+              <div class="small muted" style="white-space:normal">${esc(r.address)}</div>
+              <div class="small muted">${[r.phone && `📞 ${esc(r.phone)}`, r.url && '🔗 URLあり'].filter(Boolean).join(' · ')}</div></span></button>`).join('')
+              || '<div class="empty">見つかりませんでした。地名を足して検索してみてください。</div>'}</div>`}
+        <div class="actions"><a class="btn block" href="${esc(mapsSearch)}" target="_blank" rel="noopener" style="text-align:center;text-decoration:none;color:inherit">Google マップで開く</a></div>`;
+      bindHead(sheet);
+      $('[data-q]', sheet).addEventListener('submit', (e) => {
+        e.preventDefault();
+        query = e.target.q.value.trim();
+        if (query) run();
+      });
+      $$('[data-pick]', sheet).forEach((b) => b.addEventListener('click', () => {
+        const r = results[Number(b.dataset.pick)];
+        onPick(r);
+        toast('入力しました');
+        backSheet();
+      }));
+    };
+    const run = async () => {
+      results = null; error = '';
+      render();
+      try { results = await searchPlaces(key, query); } catch (err) { error = err.message || String(err); }
+      if (sheetStack.at(-1) === self) render(); // 検索中に画面を閉じていたら描かない
+    };
+    if (key && !results && !error) run(); else render();
+  };
+  openSheet(self);
 }
 
 // ---------------- 薬 ----------------
@@ -864,6 +928,18 @@ async function renderSettings(view) {
         ${SHORTCUT_HELP}
       </details>
     </div>
+    <h2>Google の場所検索</h2>
+    <div class="box">
+      <p class="small muted" style="margin-top:0">病院・お店の名前から住所・URL・電話番号を入れるための API キーです。キーはこの iPhone の中にだけ保存されます。</p>
+      <div class="field" style="margin-bottom:8px"><input data-key type="password" autocomplete="off" autocapitalize="off" spellcheck="false"
+        placeholder="${getMeta('places_key') ? '登録済み（変更するときだけ入力）' : 'API キーを貼り付け'}"
+        style="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:16px"></div>
+      <div class="row">
+        <button class="btn primary" data-savekey>保存</button>
+        ${getMeta('places_key') ? '<button class="btn danger" data-delkey style="flex:none">削除</button>' : ''}
+      </div>
+      <p class="small" style="margin-bottom:0">状態: ${getMeta('places_key') ? '✅ 登録済み' : '未登録'}</p>
+    </div>
     <h2>復元</h2>
     <div class="box">
       <p class="small muted" style="margin-top:0">バックアップファイル（.json）を選ぶと、<b>今のデータをすべて置き換えて</b>復元します。PC版からの移行にも使えます。</p>
@@ -910,6 +986,19 @@ async function renderSettings(view) {
     } catch (err) {
       if (err.name !== 'AbortError') alert(err.message);
     }
+  });
+
+  $('[data-savekey]', view).addEventListener('click', async () => {
+    const v = $('[data-key]', view).value.trim();
+    if (!v) { alert('API キーを入力してください'); return; }
+    await setMeta('places_key', v);
+    toast('保存しました');
+    renderTab();
+  });
+  $('[data-delkey]', view)?.addEventListener('click', async () => {
+    if (!confirm('API キーを削除しますか？')) return;
+    await setMeta('places_key', '');
+    renderTab();
   });
 
   $('[data-paste]', view).addEventListener('click', async () => {

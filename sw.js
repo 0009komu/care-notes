@@ -1,5 +1,5 @@
 // オフライン用キャッシュ。ファイルを更新したら VERSION を上げる
-const VERSION = 'v14';
+const VERSION = 'v15';
 const FILES = ['./', './index.html', './app.js', './store.js', './import-cal.js', './places.js', './calendar-export.js', './holidays.js', './push.js', './family.js', './style.css', './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {

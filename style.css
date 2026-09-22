@@ -75,6 +75,8 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
   padding: 4px 12px; cursor: pointer; white-space: nowrap; font-size: 13px; min-height: 32px;
 }
 .chip.on { border-color: var(--c, var(--accent)); background: color-mix(in srgb, var(--c, var(--accent)) 16%, var(--card)); font-weight: 600; }
+.origin-row { padding: 8px 0; border-bottom: 1px dashed var(--line); }
+.origin-row input, .origin-row select { padding: 7px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--card); min-width: 0; }
 .import-row { padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .import-row:last-child { border-bottom: 0; }
 .import-row select { width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-size: 16px; }

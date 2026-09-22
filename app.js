@@ -854,11 +854,17 @@ function bindPushSettings(view) {
   });
 }
 
-// ---------------- 行き方（自宅・会社から電車で） ----------------
-const ORIGINS = [
-  { key: 'origin_home', icon: '🏠', label: '自宅' },
-  { key: 'origin_work', icon: '🏢', label: '会社' },
-];
+// ---------------- 行き方（登録した場所から電車で） ----------------
+const ORIGIN_ICONS = ['🏠', '🏢', '👪', '🏡', '🏫', '🏥', '🚉', '🛒', '🏋️', '📍'];
+// 出発地の一覧 [{ id, icon, label, address }]。以前の「自宅・会社」だけの保存形式からも読み込む
+function origins() {
+  const list = getMeta('origins');
+  if (Array.isArray(list)) return list;
+  return [
+    { id: 'home', icon: '🏠', label: '自宅', address: getMeta('origin_home') || '' },
+    { id: 'work', icon: '🏢', label: '会社', address: getMeta('origin_work') || '' },
+  ];
+}
 // iPhone の「マップ」で乗り換え（dirflg=r は電車・バス）
 function routeUrl(origin, dest) {
   const q = new URLSearchParams({ saddr: origin, daddr: dest, dirflg: 'r' });
@@ -868,13 +874,13 @@ function routeUrl(origin, dest) {
 function routeSection(p, arriveTime = '') {
   const dest = p.address || p.name;
   if (!dest) return '';
-  const saved = ORIGINS.filter((o) => getMeta(o.key));
-  const buttons = saved.map((o) => `<a class="btn" href="${esc(routeUrl(getMeta(o.key), dest))}" target="_blank" rel="noopener"
-      style="text-decoration:none;color:inherit;display:inline-flex;align-items:center">${o.icon} ${o.label}から</a>`).join(' ');
+  const saved = origins().filter((o) => o.address);
+  const buttons = saved.map((o) => `<a class="btn" href="${esc(routeUrl(o.address, dest))}" target="_blank" rel="noopener"
+      style="text-decoration:none;color:inherit;display:inline-flex;align-items:center">${esc(o.icon)} ${esc(o.label || '登録した場所')}から</a>`).join(' ');
   return `<dt>行き方（電車）</dt><dd>
     ${saved.length ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${buttons}</div>
       <div class="small muted" style="margin-top:4px">iPhone の「マップ」で乗り換えを表示します${arriveTime ? `。${esc(arriveTime)} に着きたいときは、マップの経路画面で「今すぐ出発」を押して「到着」の時刻を選んでください` : ''}</div>`
-      : '<span class="small muted">「設定」で自宅・会社を登録すると、ここから乗り換えを調べられます</span>'}
+      : '<span class="small muted">「設定」で自宅・会社などの場所を登録すると、ここから乗り換えを調べられます</span>'}
     ${p.address ? '' : '<div class="small muted">※住所が未登録なので、名前で検索します</div>'}</dd>`;
 }
 
@@ -1338,14 +1344,20 @@ async function renderSettings(view) {
     </div>
     <h2>👪 家族と共有</h2>
     <div class="box">${familySettingsHtml()}</div>
-    <h2>自宅・会社（乗り換え検索の出発地）</h2>
+    <h2>乗り換え検索の出発地（自宅・会社など）</h2>
     <div class="box">
-      <p class="small muted" style="margin-top:0">登録すると、病院・お店や予定の画面から、ここまでの電車の乗り換えを iPhone の「マップ」で調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
-      ${ORIGINS.map((o) => `<div class="field" style="margin-bottom:10px"><label>${o.icon} ${o.label}</label>
-        <div class="row"><input data-origin="${o.key}" value="${esc(getMeta(o.key) || '')}" placeholder="例: 東京都渋谷区… / 渋谷駅"
-          style="padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:16px">
-          <button class="btn" data-originlookup="${o.key}" style="flex:none">🔍</button></div></div>`).join('')}
-      <button class="btn primary block" data-saveorigins>保存</button>
+      <p class="small muted" style="margin-top:0">登録した場所から、病院・お店までの電車の乗り換えを iPhone の「マップ」で調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
+      ${origins().map((o, i) => `<div class="origin-row" data-orow="${i}">
+        <div class="row">
+          <select data-oicon style="flex:0 0 64px">${ORIGIN_ICONS.map((ic) => `<option ${ic === o.icon ? 'selected' : ''}>${ic}</option>`).join('')}</select>
+          <input data-olabel value="${esc(o.label)}" placeholder="名前（例: 家族の会社）">
+          <button class="icon-btn" data-odel="${i}" aria-label="この場所を削除" style="flex:none">🗑️</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <input data-oaddr value="${esc(o.address)}" placeholder="例: 東京都渋谷区… / 渋谷駅">
+          <button class="btn" data-olookup="${i}" style="flex:none">🔍</button>
+        </div></div>`).join('')}
+      <div class="row" style="margin-top:8px"><button class="btn" data-oadd>＋ 場所を追加</button><button class="btn primary" data-saveorigins>保存</button></div>
     </div>
     <h2>Google の場所検索</h2>
     <div class="box">
@@ -1424,15 +1436,43 @@ async function renderSettings(view) {
     bulk.textContent = '追加しました'; bulk.disabled = true;
   });
 
+  // 入力中の内容を読み取って保存する
+  const readOrigins = () => $$('[data-orow]', view).map((row, i) => ({
+    id: origins()[i]?.id || `o${Date.now()}${i}`,
+    icon: $('[data-oicon]', row).value,
+    label: $('[data-olabel]', row).value.trim(),
+    address: $('[data-oaddr]', row).value.trim(),
+  }));
+  const saveOrigins = (list) => setMeta('origins', list);
   $('[data-saveorigins]', view).addEventListener('click', async () => {
-    for (const inp of $$('[data-origin]', view)) await setMeta(inp.dataset.origin, inp.value.trim());
+    await saveOrigins(readOrigins().filter((o) => o.label || o.address));
     toast('保存しました');
+    renderTab();
   });
-  $$('[data-originlookup]', view).forEach((b) => b.addEventListener('click', () => {
-    const inp = $(`[data-origin="${b.dataset.originlookup}"]`, view);
-    if (!inp.value.trim()) { alert('先に建物名や駅名などを入力してください'); return; }
-    openPlaceLookup(inp.value.trim(), async (hit) => {
-      await setMeta(b.dataset.originlookup, hit.address || hit.name);
+  $('[data-oadd]', view).addEventListener('click', async () => {
+    await saveOrigins([...readOrigins(), { id: `o${Date.now()}`, icon: '📍', label: '', address: '' }]);
+    await renderTab();
+    const rows = $$('[data-orow]');
+    $('[data-olabel]', rows.at(-1))?.focus();
+  });
+  $$('[data-odel]', view).forEach((b) => b.addEventListener('click', async () => {
+    const list = readOrigins();
+    const o = list[Number(b.dataset.odel)];
+    if ((o.label || o.address) && !confirm(`「${o.label || o.address}」を削除しますか？`)) return;
+    list.splice(Number(b.dataset.odel), 1);
+    await saveOrigins(list);
+    renderTab();
+  }));
+  $$('[data-olookup]', view).forEach((b) => b.addEventListener('click', async () => {
+    const list = readOrigins();
+    const i = Number(b.dataset.olookup);
+    const q = list[i].address || list[i].label;
+    if (!q) { alert('先に建物名や駅名などを入力してください'); return; }
+    await saveOrigins(list);
+    openPlaceLookup(q, async (hit) => {
+      const cur = origins();
+      cur[i] = { ...cur[i], address: hit.address || hit.name };
+      await saveOrigins(cur);
       renderTab();
     });
   }));

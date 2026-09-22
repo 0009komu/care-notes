@@ -129,6 +129,9 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
 .item .s { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .item .when { font-size: 13px; color: var(--muted); text-align: right; flex: none; }
 .item.done .t { color: var(--muted); }
+.item .when .rel { font-size: 12px; font-weight: 600; color: var(--muted); }
+.item .when .rel.today { color: var(--danger); }
+.item .when .rel.soon { color: var(--accent); }
 .thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; flex: none; background: var(--line); }
 .empty { padding: 20px; text-align: center; color: var(--muted); }
 .month-label { font-size: 13px; color: var(--muted); margin: 16px 4px 6px; font-weight: 600; }

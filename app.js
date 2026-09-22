@@ -266,6 +266,18 @@ function bindChips(view) {
     renderTab();
   }));
 }
+// 今日からの日数（「当日」「明日」「3日後」「2日前」）
+function daysFromToday(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const t = new Date();
+  return Math.round((new Date(y, m - 1, d) - new Date(t.getFullYear(), t.getMonth(), t.getDate())) / 86400000);
+}
+function relDay(dateStr) {
+  const n = daysFromToday(dateStr);
+  return n === 0 ? '当日' : n === 1 ? '明日' : n > 1 ? `${n}日後` : n === -1 ? '昨日' : `${-n}日前`;
+}
+const relClass = (dateStr) => { const n = daysFromToday(dateStr); return n === 0 ? 'today' : n > 0 && n <= 3 ? 'soon' : n < 0 ? 'past' : ''; };
+
 function eventItem(e, showDate = false) {
   const sub = [e.time, e.place_name, e.title && e.place_name ? e.title : '', e.medicine_count ? `💊${e.medicine_count}` : '', e.photo_count ? `📷${e.photo_count}` : '']
     .filter(Boolean).join(' · ');
@@ -273,7 +285,7 @@ function eventItem(e, showDate = false) {
     <span class="bar"></span>
     <span class="body"><div class="t">${esc(e.icon)} ${esc(e.title || e.place_name || e.category_name)}</div>
     <div class="s">${esc(sub || e.category_name)}</div></span>
-    ${showDate ? `<span class="when">${fmtDate(e.date)}</span>` : ''}
+    ${showDate ? `<span class="when">${fmtDate(e.date)} <span class="rel ${relClass(e.date)}">${relDay(e.date)}</span></span>` : ''}
   </button>`;
 }
 function bindEventItems(view) {
@@ -335,7 +347,8 @@ function openEventView(id) {
           ${p.phone ? `<br>📞 <a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>` : ''}
           ${p.address ? `<br>📍 <a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a>` : ''}</dd>
           ${routeSection(p, e.time)}` : ''}
-        ${e.memo ? `<dt>メモ</dt><dd class="pre">${esc(e.memo)}</dd>` : ''}
+        ${e.memo ? `<dt>📝 この予定のメモ</dt><dd class="pre">${esc(e.memo)}</dd>` : ''}
+        ${p?.memo ? `<dt>🏷️ ${esc(p.name)} のメモ（共通）</dt><dd class="pre">${esc(p.memo)}</dd>` : ''}
         ${e.medicines.length ? `<dt>薬</dt><dd><div class="box">${e.medicines.map((m) => `
           <div class="med-row" data-med="${m.id}" style="cursor:pointer">
             ${m.thumb ? `<img class="thumb" src="${photoUrl(m.thumb)}" alt="">` : '<span class="thumb" style="display:flex;align-items:center;justify-content:center">💊</span>'}
@@ -386,6 +399,7 @@ function openEventEdit(ev, date, isCopy = false) {
   if (!data.date) data.date = date || todayStr();
   let meds = (data.medicines || []).map((m) => ({ medicine_id: m.id, name: m.name, note: m.note || '' }));
   const photoState = {};
+  const placeMemos = {};
 
   openSheet(async (sheet) => {
     sheet.innerHTML = `${sheetHead(isNew ? '予定を追加' : '予定を編集')}
@@ -402,7 +416,9 @@ function openEventEdit(ev, date, isCopy = false) {
           <div class="field"><label>時刻</label><input type="time" name="time" value="${esc(data.time)}"></div>
         </div>
         <div class="field"><label>内容（例: カット＋カラー、定期診察）</label><input name="title" value="${esc(data.title)}" autocomplete="off"></div>
-        <div class="field"><label>メモ</label><textarea name="memo" placeholder="症状、担当者、次回の目安、費用など">${esc(data.memo)}</textarea></div>
+        <div class="field"><label>📝 この予定のメモ（今回だけ）</label><textarea name="memo" placeholder="今回の症状、してもらったこと、費用、次回の目安など">${esc(data.memo)}</textarea></div>
+        <div class="field" data-placememo-wrap hidden><label>🏷️ <span data-placememo-name></span> のメモ（毎回共通）</label>
+          <textarea name="place_memo" placeholder="担当の先生・スタイリスト、診療時間、持ち物など"></textarea></div>
         <div class="field"><label>薬</label><div class="box" data-meds></div></div>
         <div class="field"><label>写真</label><div data-photos></div></div>
         <label class="check"><input type="checkbox" name="done" ${data.done ? 'checked' : ''}> 完了（通院・来店済み）</label>
@@ -419,7 +435,24 @@ function openEventEdit(ev, date, isCopy = false) {
     const renderPlaces = () => {
       const list = state.places.filter((p) => p.category_id === catId);
       form.place_id.innerHTML = `<option value="">（未選択）</option>${list.map((p) => `<option value="${p.id}" ${p.id === Number(data.place_id) ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}`;
+      renderPlaceMemo();
     };
+    // 選んだ病院・お店の共通メモ（入力途中の内容は placeMemos に保持）
+    let shownPlace = null;
+    function keepPlaceMemo() {
+      if (shownPlace) placeMemos[shownPlace] = form.place_memo.value;
+    }
+    function renderPlaceMemo() {
+      keepPlaceMemo();
+      const p = state.places.find((x) => x.id === Number(form.place_id.value));
+      shownPlace = p ? p.id : null;
+      $('[data-placememo-wrap]', sheet).hidden = !p;
+      if (p) {
+        $('[data-placememo-name]', sheet).textContent = p.name;
+        form.place_memo.value = placeMemos[p.id] ?? p.memo ?? '';
+      }
+    }
+    form.place_id.addEventListener('change', renderPlaceMemo);
     const renderMeds = () => {
       const box = $('[data-meds]', sheet);
       const opts = state.medicines.filter((m) => !meds.some((x) => x.medicine_id === m.id));
@@ -445,6 +478,7 @@ function openEventEdit(ev, date, isCopy = false) {
     };
     // 別シートへ移る前に入力内容を保持
     const saveDraft = () => {
+      keepPlaceMemo();
       Object.assign(data, { category_id: catId, place_id: Number(form.place_id.value) || null, date: form.date.value, time: form.time.value,
         title: form.title.value, memo: form.memo.value, done: form.done.checked });
     };
@@ -479,6 +513,11 @@ function openEventEdit(ev, date, isCopy = false) {
         if (isNew) id = (await api('/api/events', { method: 'POST', body })).id;
         else await api(`/api/events/${id}`, { method: 'PUT', body });
         await photos.commit('event', id);
+        // 病院・お店の共通メモが変わっていれば保存
+        for (const [pid, memo] of Object.entries(placeMemos)) {
+          const p = state.places.find((x) => x.id === Number(pid));
+          if (p && (p.memo || '') !== memo) await api(`/api/places/${p.id}`, { method: 'PUT', body: { ...p, memo } });
+        }
         state.selected = data.date;
         const [y, m] = data.date.split('-').map(Number);
         state.month = new Date(y, m - 1, 1);
@@ -505,7 +544,7 @@ function openPlaceView(id) {
         ${p.url ? `<dt>URL</dt><dd><a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.url)}</a></dd>` : ''}
         ${p.address ? `<dt>住所</dt><dd><a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a></dd>` : ''}
         ${routeSection(p)}
-        ${p.memo ? `<dt>メモ</dt><dd class="pre">${esc(p.memo)}</dd>` : ''}
+        ${p.memo ? `<dt>🏷️ メモ（毎回共通）</dt><dd class="pre">${esc(p.memo)}</dd>` : ''}
         ${p.photos.length ? `<dt>写真</dt><dd>${photoGrid(p.photos)}</dd>` : ''}
         ${p.medicines.length ? `<dt>この病院の薬</dt><dd>${p.medicines.map((m) => `<a href="#" data-med="${m.id}">💊 ${esc(m.name)}</a>`).join('<br>')}</dd>` : ''}
         <dt>履歴</dt><dd>${p.events.length ? p.events.map((e) => `<a href="#" data-ev="${e.id}">${esc(e.date.replaceAll('-', '/'))}</a> ${esc(e.title)}${e.done ? '' : ' <span class="muted small">(予定)</span>'}`).join('<br>') : '<span class="muted">なし</span>'}</dd>
@@ -1277,10 +1316,6 @@ async function renderTab() {
   try {
     await renderers[state.tab](view);
     if (state.tab === 'calendar') view.insertAdjacentHTML('afterbegin', await soonBanner());
-    if (state.tab === 'list') {
-      view.insertAdjacentHTML('afterbegin', backupBanner());
-      $('[data-gobackup]', view)?.addEventListener('click', goSettings);
-    }
     // カレンダーには出さず、「設定」タブに小さな印だけ付ける
     $('.tabbar [data-tab=settings]').classList.toggle('due', backupDue());
     view.insertAdjacentHTML('afterbegin', placeWarning());

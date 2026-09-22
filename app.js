@@ -2,6 +2,7 @@
 import { openStore, api, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
 import { parseCalendarText, guessCategory } from './import-cal.js';
 import { searchPlaces } from './places.js';
+import { ALARM_OPTIONS, buildIcs, openIcs, shareIcs } from './calendar-export.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -325,8 +326,25 @@ function openEventView(id) {
       <div class="actions">
         <button class="btn" data-toggle>${e.done ? '未完了に戻す' : '✓ 完了にする'}</button>
         <button class="btn" data-next>次回の予定を作成</button>
-      </div>`;
+      </div>
+      ${e.date >= todayStr() ? `<div class="box" style="margin-top:12px">
+        <button class="btn primary block" data-tocal>🔔 iPhone のカレンダーに追加（${esc(alarmLabel())}に通知）</button>
+        <div class="small muted" style="margin-top:6px">${isExported(e) ? '✅ 追加済みです（内容を変えたときは、もう一度追加してください）。' : ''}
+          通知はカレンダーが出すので、このアプリを閉じていても届きます。通知のタイミングは「設定」で変えられます。
+          <a href="#" data-tocalshare>うまく追加できないとき</a></div>
+      </div>` : ''}`;
     bindHead(sheet);
+    $('[data-tocal]', sheet)?.addEventListener('click', async () => {
+      openIcs(buildIcs([e], alarmOpts()), `care-${e.date}.ics`);
+      await markExported([e]);
+    });
+    $('[data-tocalshare]', sheet)?.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      try {
+        await shareIcs(new File([buildIcs([e], alarmOpts())], `care-${e.date}.ics`, { type: 'text/calendar' }));
+        await markExported([e]);
+      } catch (err) { if (err.name !== 'AbortError') alert(err.message); }
+    });
     $('[data-edit]', sheet).addEventListener('click', () => openEventEdit(e));
     $('[data-place]', sheet)?.addEventListener('click', (ev) => { ev.preventDefault(); openPlaceView(p.id); });
     $$('[data-med]', sheet).forEach((r) => r.addEventListener('click', () => openMedicineView(Number(r.dataset.med))));
@@ -536,6 +554,33 @@ function openPlaceEdit(p, onCreated) {
       } catch (err) { alert(err.message); }
     });
   });
+}
+
+// ---------------- 通知（iPhone のカレンダーに追加） ----------------
+const alarmMinutes = () => getMeta('alarm_min') ?? 60;
+const alarmLabel = () => ALARM_OPTIONS.find((o) => o.value === alarmMinutes())?.label || '1時間前';
+const alarmOpts = () => ({ alarm: alarmMinutes(), dayBefore: !!getMeta('alarm_day_before') });
+// 日時が変わったら「未追加」に戻るよう、日時込みで覚えておく
+const exportKey = (e) => `${e.id}:${e.date}:${e.time}`;
+const isExported = (e) => (getMeta('cal_exported') || []).includes(exportKey(e));
+async function markExported(events) {
+  const keys = new Set(getMeta('cal_exported') || []);
+  for (const e of events) keys.add(exportKey(e));
+  await setMeta('cal_exported', [...keys].slice(-2000));
+}
+async function upcomingNotExported() {
+  const list = (await api(`/api/events?from=${todayStr()}`)).filter((e) => !e.done && !isExported(e));
+  return Promise.all(list.map((e) => api(`/api/events/${e.id}`)));
+}
+// 今日・明日の予定をカレンダーの上に出す
+async function soonBanner() {
+  const t = new Date(); t.setDate(t.getDate() + 1);
+  const list = (await api(`/api/events?from=${todayStr()}&to=${ymd(t)}`)).filter((e) => !e.done);
+  if (!list.length) return '';
+  return `<div class="box" style="margin-bottom:12px;border-color:var(--accent)">
+    <b>⏰ 今日・明日の予定</b>
+    ${list.map((e) => `<div class="small" style="margin-top:4px">${e.date === todayStr() ? '今日' : '明日'} ${esc(e.time || '')}　${esc(e.icon)} ${esc(e.title || e.place_name || e.category_name)}</div>`).join('')}
+  </div>`;
 }
 
 // ---------------- 行き方（自宅・会社から電車で） ----------------
@@ -953,6 +998,16 @@ async function renderSettings(view) {
         ${SHORTCUT_HELP}
       </details>
     </div>
+    <h2>通知</h2>
+    <div class="box">
+      <p class="small muted" style="margin-top:0">予定を iPhone のカレンダーに追加すると、カレンダーから通知が届きます（このアプリを閉じていても届きます）。</p>
+      <div class="row" style="align-items:center;margin-bottom:8px"><span style="flex:none">通知のタイミング</span>
+        <select data-alarm style="padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card)">
+          ${ALARM_OPTIONS.map((o) => `<option value="${o.value}" ${o.value === alarmMinutes() ? 'selected' : ''}>${o.label}</option>`).join('')}</select></div>
+      <label class="check"><input type="checkbox" data-daybefore ${getMeta('alarm_day_before') ? 'checked' : ''}> 前日にも通知する</label>
+      <p class="small muted">時刻のない予定は、前日の 9:00 に通知します。</p>
+      <button class="btn primary block" data-bulkcal>これからの予定をまとめて追加</button>
+    </div>
     <h2>自宅・会社（乗り換え検索の出発地）</h2>
     <div class="box">
       <p class="small muted" style="margin-top:0">登録すると、病院・お店や予定の画面から、ここまでの電車の乗り換えを Google マップで調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
@@ -1022,6 +1077,21 @@ async function renderSettings(view) {
     }
   });
 
+  $('[data-alarm]', view).addEventListener('change', async (e) => { await setMeta('alarm_min', Number(e.target.value)); toast('変更しました'); });
+  $('[data-daybefore]', view).addEventListener('change', async (e) => { await setMeta('alarm_day_before', e.target.checked); toast('変更しました'); });
+  // 予定の読み込みを先に済ませ、タップ直後にファイルを開けるようにしておく
+  let pending = await upcomingNotExported();
+  const bulk = $('[data-bulkcal]', view);
+  bulk.textContent = pending.length ? `これからの予定をまとめて追加（未追加 ${pending.length}件）` : 'カレンダーに追加していない予定はありません';
+  bulk.disabled = !pending.length;
+  bulk.addEventListener('click', async () => {
+    if (!pending.length) return;
+    openIcs(buildIcs(pending, alarmOpts()), `care-${todayStr()}.ics`);
+    await markExported(pending);
+    pending = [];
+    bulk.textContent = '追加しました'; bulk.disabled = true;
+  });
+
   $('[data-saveorigins]', view).addEventListener('click', async () => {
     for (const inp of $$('[data-origin]', view)) await setMeta(inp.dataset.origin, inp.value.trim());
     toast('保存しました');
@@ -1081,6 +1151,7 @@ async function renderTab() {
   try {
     await renderers[state.tab](view);
     if (state.tab === 'calendar' || state.tab === 'list') {
+      if (state.tab === 'calendar') view.insertAdjacentHTML('afterbegin', await soonBanner());
       view.insertAdjacentHTML('afterbegin', backupBanner());
       $('[data-gobackup]', view)?.addEventListener('click', goSettings);
     }

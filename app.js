@@ -1,12 +1,58 @@
-// 通院・美容院ノート（iPhone 版・データは端末内に保存）
+// OurTime（iPhone 版・データは端末内に保存）
 import { openStore, api as storeApi, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
 import { pushSupported, enablePush, sendJobs, testPush, disablePush } from './push.js';
+import { MEMBER_COLORS, newInviteCode, normalizeCode, joinFamily, pushFamily, pullFamily, leaveFamily } from './family.js';
 
-// 予定が変わったら通知サーバーの予約も更新する
+// 予定が変わったら通知サーバーの予約と家族共有も更新する
 async function api(path, opts = {}) {
   const res = await storeApi(path, opts);
-  if (opts.method && opts.method !== 'GET' && /^\/api\/(events|places|categories)/.test(path)) schedulePushSync();
+  if (opts.method && opts.method !== 'GET' && /^\/api\/(events|places|categories)/.test(path)) {
+    schedulePushSync();
+    scheduleFamilyPush();
+  }
   return res;
+}
+
+// ---------------- 家族共有（見るだけ） ----------------
+const family = () => getMeta('family');
+let familyTimer = null;
+function scheduleFamilyPush() {
+  if (!family()) return;
+  clearTimeout(familyTimer);
+  familyTimer = setTimeout(() => syncFamily(true), 1500);
+}
+// 自分の共有予定を送り、家族の予定を受け取る
+async function syncFamily(pushOnly = false) {
+  const fam = family();
+  if (!fam) return;
+  try {
+    const from = new Date(); from.setMonth(from.getMonth() - 3);
+    const mine = (await storeApi(`/api/events?from=${ymd(from)}`)).filter((e) => e.shared)
+      .map((e) => ({ id: e.id, date: e.date, time: e.time, title: e.title || '予定', done: e.done })); // カテゴリ・病院名・メモは送らない
+    await pushFamily(fam, { name: fam.name, color: fam.color }, mine);
+    if (!pushOnly) {
+      const members = (await pullFamily(fam)).filter((m) => m.memberId !== fam.memberId);
+      await setMeta('family_cache', { at: new Date().toISOString(), members });
+    }
+    await setMeta('family_error', '');
+  } catch (err) {
+    await setMeta('family_error', err.message);
+  }
+}
+let lastPull = 0;
+async function pullFamilyIfStale() {
+  if (!family() || Date.now() - lastPull < 60000) return false;
+  lastPull = Date.now();
+  await syncFamily();
+  return true;
+}
+// 家族の予定（期間内）: [{ date, time, title, name, color }]
+function familyEvents(from, to) {
+  const cache = getMeta('family_cache');
+  if (!family() || !cache) return [];
+  return cache.members.flatMap((m) => (m.events || [])
+    .filter((e) => e.date >= from && e.date <= to)
+    .map((e) => ({ ...e, name: m.name, color: m.color || '#7c3aed' })));
 }
 import { parseCalendarText, guessCategory } from './import-cal.js';
 import { searchPlaces } from './places.js';
@@ -49,6 +95,7 @@ const state = {
   places: [],
   medicines: [],
   masterSeg: 'places',
+  medQuery: '',
   listQuery: '',
   listPast: false,
 };
@@ -162,9 +209,9 @@ function closeAllSheets() {
   document.body.style.overflow = '';
 }
 function sheetHead(title, extra = '') {
-  return `<div class="sheet-head">
-    <button type="button" class="icon-btn" data-back aria-label="戻る">${sheetStack.length > 1 ? '‹' : '✕'}</button>
-    <h1>${esc(title)}</h1>${extra}</div>`;
+  // 閉じる／戻るボタンは右手の親指で押しやすい右下に置く
+  return `<div class="sheet-head"><h1>${esc(title)}</h1>${extra}</div>
+    <button type="button" class="sheet-close" data-back aria-label="${sheetStack.length > 1 ? '戻る' : '閉じる'}">${sheetStack.length > 1 ? '‹' : '✕'}</button>`;
 }
 function bindHead(sheet) {
   $('[data-back]', sheet)?.addEventListener('click', backSheet);
@@ -194,6 +241,11 @@ async function renderCalendar(view) {
     .filter((e) => !state.filter.size || state.filter.has(e.category_id));
   const byDate = {};
   for (const e of events) (byDate[e.date] ||= []).push(e);
+  // 家族の予定（見るだけ）
+  const famByDate = {};
+  for (const e of familyEvents(ymd(start), ymd(end))) (famByDate[e.date] ||= []).push(e);
+  for (const l of Object.values(famByDate)) l.sort((a, b) => (a.time || '99') < (b.time || '99') ? -1 : 1);
+  const famPill = (e) => `<span class="pill fam ${e.done ? 'done' : ''}" style="--c:${esc(e.color)}">${esc(e.name.slice(0, 2))}:${esc(e.title)}</span>`;
 
   const today = todayStr();
   let cells = '';
@@ -201,16 +253,20 @@ async function renderCalendar(view) {
     const d = new Date(start); d.setDate(start.getDate() + i);
     const ds = ymd(d);
     const list = byDate[ds] || [];
+    const fam = famByDate[ds] || [];
     const hol = holidayName(ds);
     const cls = ['cal-day', d.getMonth() !== m.getMonth() && 'other', ds === today && 'today', ds === state.selected && 'sel',
       (d.getDay() === 0 || hol) && 'sun', d.getDay() === 6 && !hol && 'sat'].filter(Boolean).join(' ');
     cells += `<button class="${cls}" data-date="${ds}"><span class="daytop"><span class="num">${d.getDate()}</span>${hol ? `<span class="hol">${esc(hol)}</span>` : ''}</span>
-      ${list.slice(0, 3).map((e) => `<span class="pill ${e.done ? 'done' : ''}" style="--c:${esc(e.color)}">${esc(e.icon)}${esc(e.place_name || e.title || e.category_name)}</span>`).join('')}
-      ${list.length > 3 ? `<span class="more">+${list.length - 3}</span>` : ''}</button>`;
+      ${[...list.map((e) => `<span class="pill ${e.done ? 'done' : ''}" style="--c:${esc(e.color)}">${esc(e.icon)}${esc(e.place_name || e.title || e.category_name)}</span>`), ...fam.map(famPill)].slice(0, 3).join('')}
+      ${list.length + fam.length > 3 ? `<span class="more">+${list.length + fam.length - 3}</span>` : ''}</button>`;
     if (i === 34 && d >= new Date(m.getFullYear(), m.getMonth() + 1, 0)) break; // 5週で収まる月
   }
 
   const dayEvents = byDate[state.selected] || [];
+  const dayFam = famByDate[state.selected] || [];
+  const famItem = (e) => `<div class="item fam ${e.done ? 'done' : ''}" style="--c:${esc(e.color)};cursor:default"><span class="bar"></span>
+    <span class="body"><div class="t">${esc(e.title)}</div><div class="s">👤 ${esc(e.name)}の予定${e.time ? ` · ${esc(e.time)}` : ''}</div></span></div>`;
   view.innerHTML = `
     <div class="cal-head">
       <button class="icon-btn" data-nav="-1" aria-label="前の月">‹</button>
@@ -224,8 +280,10 @@ async function renderCalendar(view) {
       <div class="cal-grid">${cells}</div>
     </div>
     <h2>${fmtLongDate(state.selected)}${holidayName(state.selected) ? ` <span style="color:#dc2626">${esc(holidayName(state.selected))}</span>` : ''}</h2>
-    <div class="card">${dayEvents.length ? dayEvents.map(eventItem).join('') : '<div class="empty">予定はありません</div>'}</div>
+    <div class="card">${dayEvents.length || dayFam.length ? dayEvents.map((e) => eventItem(e)).join('') + dayFam.map(famItem).join('') : '<div class="empty">予定はありません</div>'}</div>
     <button class="fab" data-add aria-label="予定を追加">＋</button>`;
+  // 家族の予定は1分以上たっていれば取り直して描き直す
+  pullFamilyIfStale().then((pulled) => { if (pulled && state.tab === 'calendar') renderTab(); });
 
   $$('[data-nav]', view).forEach((b) => b.addEventListener('click', () => {
     state.month = new Date(m.getFullYear(), m.getMonth() + Number(b.dataset.nav), 1);
@@ -239,7 +297,7 @@ async function renderCalendar(view) {
   });
   $$('[data-date]', view).forEach((b) => b.addEventListener('click', () => {
     const ds = b.dataset.date;
-    if (state.selected === ds && (byDate[ds] || []).length === 0) { openEventEdit(null, ds); return; }
+    if (state.selected === ds && (byDate[ds] || []).length === 0 && (famByDate[ds] || []).length === 0) { openEventEdit(null, ds); return; }
     state.selected = ds;
     const [y, mo] = ds.split('-').map(Number);
     if (mo - 1 !== m.getMonth()) state.month = new Date(y, mo - 1, 1);
@@ -338,7 +396,8 @@ function openEventView(id) {
     const e = await api(`/api/events/${id}`);
     const p = e.place;
     sheet.innerHTML = `${sheetHead(fmtLongDate(e.date), '<button class="btn" data-edit>編集</button>')}
-      <div style="--c:${esc(e.color)}"><span class="badge">${esc(e.icon)} ${esc(e.category_name)}</span> ${e.done ? '<span class="badge" style="--c:#78716c">済</span>' : ''}</div>
+      <div style="--c:${esc(e.color)}"><span class="badge">${esc(e.icon)} ${esc(e.category_name)}</span> ${e.done ? '<span class="badge" style="--c:#78716c">済</span>' : ''}
+        ${e.shared && getMeta('family') ? '<span class="badge" style="--c:#7c3aed">👪 家族と共有中</span>' : ''}</div>
       <h1 style="margin:8px 0 0;font-size:20px">${esc(e.title || e.place_name || e.category_name)}</h1>
       <dl class="detail">
         ${e.time ? `<dt>時刻</dt><dd class="pre">${esc(e.time)}</dd>` : ''}
@@ -387,7 +446,7 @@ function openEventView(id) {
       showSheet();
     });
     $('[data-next]', sheet).addEventListener('click', () => {
-      openEventEdit({ category_id: e.category_id, place_id: e.place_id, title: e.title, date: '', time: e.time, memo: '', medicines: [], photos: [] }, null, true);
+      openEventEdit({ category_id: e.category_id, place_id: e.place_id, title: e.title, date: '', time: e.time, memo: '', medicines: [], photos: [], shared: e.shared }, null, true);
     });
   });
 }
@@ -422,6 +481,7 @@ function openEventEdit(ev, date, isCopy = false) {
         <div class="field"><label>薬</label><div class="box" data-meds></div></div>
         <div class="field"><label>写真</label><div data-photos></div></div>
         <label class="check"><input type="checkbox" name="done" ${data.done ? 'checked' : ''}> 完了（通院・来店済み）</label>
+        ${getMeta('family') ? `<label class="check"><input type="checkbox" name="shared" ${data.shared ? 'checked' : ''}> 👪 家族と共有する（日付・時間・内容だけ）</label>` : ''}
         <div class="actions">
           ${!isNew ? '<button type="button" class="btn danger" data-delete style="flex:0 0 auto">削除</button>' : ''}
           <button class="btn primary">保存</button>
@@ -480,7 +540,8 @@ function openEventEdit(ev, date, isCopy = false) {
     const saveDraft = () => {
       keepPlaceMemo();
       Object.assign(data, { category_id: catId, place_id: Number(form.place_id.value) || null, date: form.date.value, time: form.time.value,
-        title: form.title.value, memo: form.memo.value, done: form.done.checked });
+        title: form.title.value, memo: form.memo.value, done: form.done.checked,
+        shared: form.shared ? form.shared.checked : !!data.shared });
     };
 
     renderCats(); renderPlaces(); renderMeds();
@@ -660,7 +721,7 @@ async function buildPushJobs() {
     const add = (at, label) => {
       if (at <= now) return;
       jobs.push(hidden
-        ? { at, title: '通院・美容院ノート', body: `予定の${label}です` }
+        ? { at, title: 'OurTime', body: `予定の${label}です` }
         : { at, title: name, body: `${fmtDate(e.date)} ${when}${e.place_name && e.place_name !== e.title ? ` ${e.place_name}` : ''}（${label}）` });
     };
     // 時刻のない予定は前日 9:00（カレンダー追加のときと同じ）
@@ -686,11 +747,80 @@ async function syncPush() {
   }
 }
 
+const fmtCode = (c) => normalizeCode(c).match(/.{1,4}/g)?.join('-') || '';
+function familySettingsHtml() {
+  const fam = family();
+  const inputStyle = 'padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:var(--card)';
+  if (!fam) {
+    return `<p class="small muted" style="margin-top:0">「家族と共有」にした予定の <b>日付・時間・内容</b> だけを家族に見せられます（家族は見るだけ）。カテゴリ・病院名・薬・写真・メモは共有しません。予定は暗号化して送るので、サーバーの管理者にも中身は読めません。</p>
+      <div class="field"><label>あなたの表示名（家族に見える名前）</label><input data-famname maxlength="10" placeholder="例: たつや" style="width:100%;${inputStyle}"></div>
+      <button class="btn primary block" data-famcreate>家族グループを作る</button>
+      <p class="small muted" style="margin:10px 0 4px">家族から招待コードをもらった場合</p>
+      <div class="row"><input data-famcode placeholder="XXXX-XXXX-XXXX-XXXX" autocapitalize="characters" autocomplete="off" style="${inputStyle}">
+        <button class="btn" data-famjoin style="flex:none">参加</button></div>`;
+  }
+  const cache = getMeta('family_cache');
+  const err = getMeta('family_error');
+  const members = cache?.members || [];
+  return `<p class="small" style="margin-top:0">あなたの表示名: <b>${esc(fam.name)}</b>　色:
+      ${MEMBER_COLORS.map((c) => `<button class="color-opt ${c === fam.color ? 'on' : ''}" data-famcolor="${c}" style="--c:${c};width:26px;height:26px;vertical-align:middle" aria-label="色"></button>`).join(' ')}</p>
+    <div class="field"><label>招待コード（家族に伝えてください）</label>
+      <div class="row"><input readonly value="${esc(fmtCode(fam.code))}" style="${inputStyle};font-family:monospace;letter-spacing:1px">
+        <button class="btn" data-famshare style="flex:none">送る</button></div></div>
+    <p class="small" style="margin:6px 0">家族: ${members.length ? members.map((m) => `<span class="badge" style="--c:${esc(m.color || '#7c3aed')}">👤 ${esc(m.name)}</span>`).join(' ') : '<span class="muted">まだ誰も参加していません</span>'}</p>
+    <p class="small muted" style="margin:0 0 8px">${cache ? `最終同期: ${new Date(cache.at).toLocaleString('ja-JP')}` : ''}${err ? `<br><span style="color:var(--danger)">⚠️ ${esc(err)}</span>` : ''}<br>
+      共有する予定は、予定の編集画面で「👪 家族と共有する」にチェックを入れてください。</p>
+    <div class="row"><button class="btn" data-famsync>今すぐ同期</button><button class="btn danger" data-famleave style="flex:none">グループから抜ける</button></div>`;
+}
+function bindFamilySettings(view) {
+  const start = async (create) => {
+    const name = ($('[data-famname]', view)?.value || '').trim();
+    const code = create ? newInviteCode() : ($('[data-famcode]', view)?.value || '').trim();
+    if (!name) { alert('先に「あなたの表示名」を入力してください'); return; }
+    if (!create && normalizeCode(code).length !== 16) { alert('招待コードは16文字です（ハイフンはあってもなくても大丈夫です）'); return; }
+    try {
+      const fam = await joinFamily(code, create);
+      await setMeta('family', { ...fam, name, color: create ? MEMBER_COLORS[0] : MEMBER_COLORS[1] });
+      lastPull = 0;
+      await syncFamily();
+      toast(create ? '家族グループを作りました' : '家族グループに参加しました');
+    } catch (err) { alert(err.message); }
+    renderTab();
+  };
+  $('[data-famcreate]', view)?.addEventListener('click', () => start(true));
+  $('[data-famjoin]', view)?.addEventListener('click', () => start(false));
+  $('[data-famshare]', view)?.addEventListener('click', async () => {
+    const text = `OurTimeの家族グループの招待コード: ${fmtCode(family().code)}\nアプリ: https://0009komu.github.io/care-notes/\n（アプリの「設定」→「家族と共有」で入力してください）`;
+    try {
+      if (navigator.share) await navigator.share({ text });
+      else { await navigator.clipboard.writeText(text); toast('コピーしました'); }
+    } catch (err) { if (err.name !== 'AbortError') alert(err.message); }
+  });
+  $$('[data-famcolor]', view).forEach((b) => b.addEventListener('click', async () => {
+    await setMeta('family', { ...family(), color: b.dataset.famcolor });
+    await syncFamily(true);
+    renderTab();
+  }));
+  $('[data-famsync]', view)?.addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = '同期中…';
+    lastPull = Date.now();
+    await syncFamily();
+    renderTab();
+  });
+  $('[data-famleave]', view)?.addEventListener('click', async () => {
+    if (!confirm('家族グループから抜けますか？（あなたの共有予定は家族から見えなくなります）')) return;
+    try { await leaveFamily(family()); } catch { /* サーバー側で消えていても抜けられるようにする */ }
+    await setMeta('family', null);
+    await setMeta('family_cache', null);
+    renderTab();
+  });
+}
+
 function pushSettingsHtml() {
   const on = !!pushDevice();
   const synced = getMeta('push_synced');
   if (!pushSupported() || !isStandalone) {
-    return `<p class="small muted" style="margin:0">ホーム画面の「通院ノート」アイコンから開くと使えます（iOS 16.4 以降）。</p>`;
+    return `<p class="small muted" style="margin:0">ホーム画面の「OurTime」アイコンから開くと使えます（iOS 16.4 以降）。</p>`;
   }
   return `<p class="small" style="margin:0 0 6px">状態: ${on ? '✅ オン' : 'オフ'}${on && synced ? `<span class="muted">（${synced.error ? `⚠️ ${esc(synced.error)}` : `${synced.count}件を予約済み`}）</span>` : ''}</p>
     ${on ? `<label class="check"><input type="checkbox" data-pushprivate ${getMeta('push_private') ? 'checked' : ''}> 通知に予定名を出さない（「予定の1時間前です」だけにする）</label>
@@ -797,6 +927,13 @@ function openPlaceLookup(initialQuery, onPick) {
 }
 
 // ---------------- 薬 ----------------
+// 薬の効能などを調べるリンク（KEGG MEDICUS は添付文書・薬効が見られる医薬品データベース）
+function drugLinks(name) {
+  const q = encodeURIComponent(name.trim());
+  const link = (href, label) => `<a class="btn" href="${href}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit;display:inline-flex;align-items:center;min-height:36px;padding:4px 12px;margin:0 6px 6px 0">${label}</a>`;
+  return link(`https://www.kegg.jp/medicus-bin/search_drug?search_keyword=${q}`, '💊 添付文書・薬効（KEGG）')
+    + link(`https://www.google.com/search?q=${q}+${encodeURIComponent('効能 副作用')}`, '🔍 Google で検索');
+}
 function openMedicineView(id) {
   openSheet(async (sheet) => {
     const m = await api(`/api/medicines/${id}`);
@@ -804,6 +941,7 @@ function openMedicineView(id) {
       <dl class="detail">
         ${m.photos.length ? `<dt>写真</dt><dd>${photoGrid(m.photos)}</dd>` : ''}
         ${m.efficacy ? `<dt>効能</dt><dd class="pre">${esc(m.efficacy)}</dd>` : ''}
+        <dt>薬の情報を調べる</dt><dd>${drugLinks(m.name)}</dd>
         ${m.usage ? `<dt>使い方・飲み方</dt><dd class="pre">${esc(m.usage)}</dd>` : ''}
         ${m.place_name ? `<dt>処方元</dt><dd><a href="#" data-place="${m.place_id}">${esc(m.place_name)}</a></dd>` : ''}
         ${m.memo ? `<dt>メモ</dt><dd class="pre">${esc(m.memo)}</dd>` : ''}
@@ -820,7 +958,8 @@ function openMedicineEdit(m, onCreated) {
   openSheet(async (sheet) => {
     sheet.innerHTML = `${sheetHead(isNew ? '薬を追加' : '薬を編集')}
       <form>
-        <div class="field"><label>薬の名前</label><input name="name" required value="${esc(m.name)}" placeholder="例: ヒルドイドソフト軟膏"></div>
+        <div class="field"><label>薬の名前</label><input name="name" required value="${esc(m.name)}" placeholder="例: ヒルドイドソフト軟膏">
+          <div data-druglinks style="margin-top:6px"></div></div>
         <div class="field"><label>写真</label><div data-photos></div></div>
         <div class="field"><label>効能</label><textarea name="efficacy" style="min-height:60px" placeholder="例: 保湿、乾燥肌の改善">${esc(m.efficacy)}</textarea></div>
         <div class="field"><label>使い方・飲み方</label><input name="usage" value="${esc(m.usage)}" placeholder="例: 1日2回 患部に塗る"></div>
@@ -837,6 +976,13 @@ function openMedicineEdit(m, onCreated) {
     bindHead(sheet);
     const form = $('form', sheet);
     const photos = photoEditor($('[data-photos]', sheet), m.photos || []);
+    // 名前を入れると、効能を調べるリンクが出る（調べた内容は「効能」欄に貼り付け）
+    const renderDrugLinks = () => {
+      const v = form.name.value.trim();
+      $('[data-druglinks]', sheet).innerHTML = v ? `<div class="small muted" style="margin-bottom:4px">効能・使い方を調べる</div>${drugLinks(v)}` : '';
+    };
+    form.name.addEventListener('input', renderDrugLinks);
+    renderDrugLinks();
     $('[data-delete]', sheet)?.addEventListener('click', async () => {
       if (!confirm(`「${m.name}」を削除しますか？（予定からも外れます）`)) return;
       await api(`/api/medicines/${m.id}`, { method: 'DELETE' });
@@ -937,10 +1083,19 @@ async function renderMaster(view) {
           || '<div class="empty small">未登録</div>'}</div>`;
     }).join('');
   } else if (seg === 'medicines') {
-    body = `<div class="card">${state.medicines.map((m) => `<button class="item" data-med="${m.id}">
+    const q = state.medQuery.trim();
+    const hit = (m) => !q || [m.name, m.efficacy, m.memo].some((s) => (s || '').toLowerCase().includes(q.toLowerCase()));
+    const medRow = (m) => `<button class="item" data-med="${m.id}">
       ${m.thumb ? `<img class="thumb" src="${photoUrl(m.thumb)}" alt="" loading="lazy">` : '<span class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:22px">💊</span>'}
-      <span class="body"><div class="t">${esc(m.name)}</div><div class="s">${esc(m.efficacy || m.place_name || '')}</div></span></button>`).join('')
-      || '<div class="empty">薬は未登録です</div>'}</div>`;
+      <span class="body"><div class="t">${esc(m.name)}</div><div class="s">${esc(m.efficacy || m.place_name || '')}</div></span></button>`;
+    // カテゴリごとに分けて表示（カテゴリなしは最後）
+    const groups = [...state.categories.map((c) => ({ c, list: state.medicines.filter((m) => m.category_id === c.id && hit(m)) })),
+      { c: null, list: state.medicines.filter((m) => !catById(m.category_id) && hit(m)) }].filter((g) => g.list.length);
+    body = `<input class="search" type="search" data-medq placeholder="薬の名前で検索" value="${esc(q)}">
+      ${q ? `<div class="box small" style="margin-bottom:10px">「${esc(q)}」の効能・使い方を調べる<div style="margin-top:6px">${drugLinks(q)}</div></div>` : ''}
+      ${groups.map((g) => `<div class="month-label">${g.c ? `<span class="dot" style="--c:${esc(g.c.color)}"></span>${esc(g.c.icon)} ${esc(g.c.name)}` : 'カテゴリなし'}</div>
+        <div class="card">${g.list.map(medRow).join('')}</div>`).join('')
+      || `<div class="card"><div class="empty">${q ? '登録済みの薬にはありません' : '薬は未登録です'}</div></div>`}`;
   } else {
     const n = state.categories.length;
     body = `<p class="small muted" style="margin:0 4px 6px">▲▼ で並び順を変えられます（カレンダーの上の並びにも反映されます）</p>
@@ -960,6 +1115,16 @@ async function renderMaster(view) {
     ${body}
     <button class="fab" data-add aria-label="追加">＋</button>`;
   $$('[data-seg]', view).forEach((b) => b.addEventListener('click', () => { state.masterSeg = b.dataset.seg; renderTab(); }));
+  const medq = $('[data-medq]', view);
+  medq?.addEventListener('input', () => {
+    clearTimeout(renderMaster.t);
+    renderMaster.t = setTimeout(async () => {
+      state.medQuery = medq.value;
+      await renderTab();
+      const i = $('[data-medq]');
+      i.focus(); i.setSelectionRange(i.value.length, i.value.length);
+    }, 400);
+  });
   $$('[data-place]', view).forEach((b) => b.addEventListener('click', () => openPlaceView(Number(b.dataset.place))));
   $$('[data-med]', view).forEach((b) => b.addEventListener('click', () => openMedicineView(Number(b.dataset.med))));
   $$('[data-cat]', view).forEach((b) => b.addEventListener('click', () => openCategoryEdit(catById(b.dataset.cat))));
@@ -1006,12 +1171,12 @@ function placeWarning() {
   if (!isIOS || isStandalone) return '';
   return `<div class="box" style="border:2px solid var(--danger);margin-bottom:12px">
     <b style="color:var(--danger)">⚠️ ここで入力したデータは、ホーム画面のアプリには保存されません</b>
-    <p class="small" style="margin:6px 0 0">いまは Safari または他のアプリの中で開いています。必ず<b>ホーム画面の「通院ノート」アイコン</b>から開いて使ってください。</p>
+    <p class="small" style="margin:6px 0 0">いまは Safari または他のアプリの中で開いています。必ず<b>ホーム画面の「OurTime」アイコン</b>から開いて使ってください。</p>
     <details class="small" style="margin-top:6px"><summary style="color:var(--accent);cursor:pointer">ホーム画面に追加する方法</summary>
       <ol style="padding-left:20px;margin:6px 0 0;line-height:1.7">
         <li><b>Safari</b> で https://0009komu.github.io/care-notes/ を開く（Claude などのアプリ内で開いている場合は、右下などの「Safariで開く」を押す）</li>
         <li>下の共有ボタン（□↑）→「ホーム画面に追加」→「追加」</li>
-        <li>ホーム画面にできた「通院ノート」アイコンから開く</li>
+        <li>ホーム画面にできた「OurTime」アイコンから開く</li>
       </ol></details>
   </div>`;
 }
@@ -1035,7 +1200,7 @@ const SHORTCUT_HELP = `<ol class="small" style="padding-left:20px;margin:8px 0 0
     3行目: 変数「繰り返し項目」→ <b>場所</b><br>
     4行目: 変数「繰り返し項目」→ <b>メモ</b></li>
   <li>「繰り返しの終了」の下に <b>クリップボードにコピー</b> を追加（入力は「繰り返しの結果」）</li>
-  <li>名前を「通院ノートに送る」などにして完了</li>
+  <li>名前を「OurTimeに送る」などにして完了</li>
 </ol>
 <p class="small muted">使うとき: ショートカットを実行 → このアプリを開いて「コピーした予定を貼り付け」。初回はカレンダーへのアクセス許可を聞かれます。</p>`;
 
@@ -1171,6 +1336,8 @@ async function renderSettings(view) {
       <p class="small muted" style="margin:0 0 6px">アプリからの通知が使えないときの方法です。</p>
       <button class="btn block" data-bulkcal>これからの予定をまとめて追加</button>
     </div>
+    <h2>👪 家族と共有</h2>
+    <div class="box">${familySettingsHtml()}</div>
     <h2>自宅・会社（乗り換え検索の出発地）</h2>
     <div class="box">
       <p class="small muted" style="margin-top:0">登録すると、病院・お店や予定の画面から、ここまでの電車の乗り換えを iPhone の「マップ」で調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
@@ -1243,6 +1410,7 @@ async function renderSettings(view) {
   $('[data-alarm]', view).addEventListener('change', async (e) => { await setMeta('alarm_min', Number(e.target.value)); schedulePushSync(); toast('変更しました'); });
   $('[data-daybefore]', view).addEventListener('change', async (e) => { await setMeta('alarm_day_before', e.target.checked); schedulePushSync(); toast('変更しました'); });
   bindPushSettings(view);
+  bindFamilySettings(view);
   // 予定の読み込みを先に済ませ、タップ直後にファイルを開けるようにしておく
   let pending = await upcomingNotExported();
   const bulk = $('[data-bulkcal]', view);
@@ -1346,7 +1514,7 @@ function showLock() {
     const view = $('#view');
     view.innerHTML = `<div style="max-width:320px;margin:15vh auto 0;text-align:center">
       <img src="icon.svg" alt="" width="72" height="72" style="border-radius:16px">
-      <h1 style="margin:12px 0 4px">通院・美容院ノート</h1>
+      <h1 style="margin:12px 0 4px">OurTime</h1>
       <p class="small muted">最初に一度だけ、パスワードを入力してください</p>
       <form data-lock><input type="password" inputmode="numeric" autocomplete="off" name="pw" placeholder="パスワード"
         style="width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:20px;text-align:center;letter-spacing:6px">

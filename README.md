@@ -1,4 +1,4 @@
-# 通院・美容院ノート（iPhone 版）
+# OurTime（iPhone 版）
 
 サーバーを使わず、iPhone の中だけで動く版です。機能は PC 版と同じです。
 

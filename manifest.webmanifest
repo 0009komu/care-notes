@@ -1,6 +1,6 @@
 {
-  "name": "通院・美容院ノート",
-  "short_name": "通院ノート",
+  "name": "OurTime",
+  "short_name": "OurTime",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

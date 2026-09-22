@@ -23,7 +23,7 @@ async function call(method, path, body) {
 export async function enablePush() {
   if (!pushSupported()) throw new Error('この端末では通知を使えません。iOS 16.4 以降で、ホーム画面のアイコンから開いてください');
   const perm = await Notification.requestPermission();
-  if (perm !== 'granted') throw new Error('通知が許可されませんでした。iPhone の「設定」→「通知」→「通院ノート」で許可できます');
+  if (perm !== 'granted') throw new Error('通知が許可されませんでした。iPhone の「設定」→「通知」→「OurTime」で許可できます');
   const reg = await navigator.serviceWorker.ready;
   const { publicKey } = await call('GET', '/vapid');
   let sub = await reg.pushManager.getSubscription();

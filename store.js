@@ -272,7 +272,7 @@ route('GET', '/api/events/:id', ([id]) => {
   };
 });
 function eventFields(b) {
-  const f = { category_id: Number(b.category_id), place_id: idOrNull(b.place_id), date: str(b.date), time: str(b.time), title: str(b.title), memo: str(b.memo), done: b.done ? 1 : 0, ext_id: str(b.ext_id) };
+  const f = { category_id: Number(b.category_id), place_id: idOrNull(b.place_id), date: str(b.date), time: str(b.time), title: str(b.title), memo: str(b.memo), done: b.done ? 1 : 0, ext_id: str(b.ext_id), shared: b.shared ? 1 : 0 };
   if (!f.category_id) bad('カテゴリを選んでください');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date)) bad('日付が正しくありません');
   return f;
@@ -386,7 +386,7 @@ export async function exportBackup() {
 
 export async function importBackup(file) {
   const json = JSON.parse(await file.text());
-  if (json?.app !== 'care-calendar' || !json.data) throw new Error('通院ノートのバックアップファイルではありません');
+  if (json?.app !== 'care-calendar' || !json.data) throw new Error('OurTimeのバックアップファイルではありません');
   const t = tx([...TABLES, 'blobs']);
   for (const name of [...TABLES, 'blobs']) t.objectStore(name).clear();
   for (const name of TABLES) {

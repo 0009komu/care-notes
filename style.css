@@ -114,6 +114,9 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .pill.done { color: var(--muted); }
+/* 家族の予定は点線の枠で区別する */
+.pill.fam { background: transparent; border: 1px dashed var(--c); border-left: 3px solid var(--c); }
+.item.fam .bar { background: repeating-linear-gradient(var(--c) 0 4px, transparent 4px 7px); }
 .more { font-size: 10px; color: var(--muted); padding-left: 2px; }
 
 /* lists */
@@ -154,6 +157,13 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
   position: sticky; top: 0; background: var(--bg); display: flex; align-items: center; gap: 8px;
   padding: 8px 0 8px; z-index: 2; border-bottom: 1px solid var(--line); margin-bottom: 8px;
 }
+.sheet-close {
+  position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 30;
+  width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  font-size: 24px; line-height: 1; box-shadow: 0 4px 12px rgba(0,0,0,.25); cursor: pointer;
+}
+@media (min-width: 700px) { .sheet-close { position: sticky; float: right; bottom: 0; margin-top: 8px; } }
+.sheet { padding-bottom: calc(84px + env(safe-area-inset-bottom)) !important; }
 .sheet-head h1 { flex: 1; font-size: 16px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sheet-head .btn { min-height: 36px; padding: 6px 14px; }
 .field { margin-bottom: 8px; }

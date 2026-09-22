@@ -1,8 +1,17 @@
 // 通院・美容院ノート（iPhone 版・データは端末内に保存）
-import { openStore, api, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
+import { openStore, api as storeApi, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
+import { pushSupported, enablePush, sendJobs, testPush, disablePush } from './push.js';
+
+// 予定が変わったら通知サーバーの予約も更新する
+async function api(path, opts = {}) {
+  const res = await storeApi(path, opts);
+  if (opts.method && opts.method !== 'GET' && /^\/api\/(events|places|categories)/.test(path)) schedulePushSync();
+  return res;
+}
 import { parseCalendarText, guessCategory } from './import-cal.js';
 import { searchPlaces } from './places.js';
 import { ALARM_OPTIONS, buildIcs, openIcs, shareIcs } from './calendar-export.js';
+import { holidayName } from './holidays.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -129,7 +138,17 @@ async function showSheet() {
   sheet.hidden = false;
   document.body.style.overflow = 'hidden';
   await render(sheet);
+  addHeadSave(sheet);
   sheet.scrollTop = 0;
+}
+// 入力画面では、上の見出しにも「保存」を置いてスクロールせずに保存できるようにする
+function addHeadSave(sheet) {
+  const head = $('.sheet-head', sheet);
+  if (!head || $('[data-headsave]', head)) return;
+  const form = [...sheet.querySelectorAll('form')].find((f) => [...f.querySelectorAll('button.primary')].some((b) => b.type === 'submit' && b.textContent.trim() === '保存'));
+  if (!form) return;
+  head.insertAdjacentHTML('beforeend', '<button type="button" class="btn primary" data-headsave>保存</button>');
+  $('[data-headsave]', head).addEventListener('click', () => form.requestSubmit());
 }
 function backSheet() {
   sheetStack.pop();
@@ -182,9 +201,10 @@ async function renderCalendar(view) {
     const d = new Date(start); d.setDate(start.getDate() + i);
     const ds = ymd(d);
     const list = byDate[ds] || [];
+    const hol = holidayName(ds);
     const cls = ['cal-day', d.getMonth() !== m.getMonth() && 'other', ds === today && 'today', ds === state.selected && 'sel',
-      d.getDay() === 0 && 'sun', d.getDay() === 6 && 'sat'].filter(Boolean).join(' ');
-    cells += `<button class="${cls}" data-date="${ds}"><span class="num">${d.getDate()}</span>
+      (d.getDay() === 0 || hol) && 'sun', d.getDay() === 6 && !hol && 'sat'].filter(Boolean).join(' ');
+    cells += `<button class="${cls}" data-date="${ds}"><span class="daytop"><span class="num">${d.getDate()}</span>${hol ? `<span class="hol">${esc(hol)}</span>` : ''}</span>
       ${list.slice(0, 3).map((e) => `<span class="pill ${e.done ? 'done' : ''}" style="--c:${esc(e.color)}">${esc(e.icon)}${esc(e.place_name || e.title || e.category_name)}</span>`).join('')}
       ${list.length > 3 ? `<span class="more">+${list.length - 3}</span>` : ''}</button>`;
     if (i === 34 && d >= new Date(m.getFullYear(), m.getMonth() + 1, 0)) break; // 5週で収まる月
@@ -203,7 +223,7 @@ async function renderCalendar(view) {
       <div class="cal-grid">${DOW.map((w, i) => `<div class="cal-dow ${i === 0 ? 'sun' : i === 6 ? 'sat' : ''}">${w}</div>`).join('')}</div>
       <div class="cal-grid">${cells}</div>
     </div>
-    <h2>${fmtLongDate(state.selected)}</h2>
+    <h2>${fmtLongDate(state.selected)}${holidayName(state.selected) ? ` <span style="color:#dc2626">${esc(holidayName(state.selected))}</span>` : ''}</h2>
     <div class="card">${dayEvents.length ? dayEvents.map(eventItem).join('') : '<div class="empty">予定はありません</div>'}</div>
     <button class="fab" data-add aria-label="予定を追加">＋</button>`;
 
@@ -253,7 +273,7 @@ function eventItem(e, showDate = false) {
     <span class="bar"></span>
     <span class="body"><div class="t">${esc(e.icon)} ${esc(e.title || e.place_name || e.category_name)}</div>
     <div class="s">${esc(sub || e.category_name)}</div></span>
-    ${showDate ? `<span class="when">${fmtDate(e.date)}${e.done ? '<br>済' : ''}</span>` : ''}
+    ${showDate ? `<span class="when">${fmtDate(e.date)}</span>` : ''}
   </button>`;
 }
 function bindEventItems(view) {
@@ -483,7 +503,6 @@ function openPlaceView(id) {
       ${c ? `<span class="badge" style="--c:${esc(c.color)}">${esc(c.icon)} ${esc(c.name)}</span>` : ''}
       <dl class="detail">
         ${p.url ? `<dt>URL</dt><dd><a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.url)}</a></dd>` : ''}
-        ${p.phone ? `<dt>電話</dt><dd><a href="tel:${esc(p.phone)}">${esc(p.phone)}</a></dd>` : ''}
         ${p.address ? `<dt>住所</dt><dd><a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a></dd>` : ''}
         ${routeSection(p)}
         ${p.memo ? `<dt>メモ</dt><dd class="pre">${esc(p.memo)}</dd>` : ''}
@@ -583,14 +602,98 @@ async function soonBanner() {
   </div>`;
 }
 
+// ---------------- 通知（このアプリから・Web Push） ----------------
+const pushDevice = () => getMeta('push_device');
+// これからの予定から「いつ・何を通知するか」を作る（詳細は送らない）
+async function buildPushJobs() {
+  const now = Date.now();
+  const limit = new Date(); limit.setDate(limit.getDate() + 90);
+  const events = (await storeApi(`/api/events?from=${todayStr()}&to=${ymd(limit)}`)).filter((e) => !e.done);
+  const { alarm, dayBefore } = alarmOpts();
+  const hidden = !!getMeta('push_private');
+  const jobs = [];
+  for (const e of events) {
+    const [y, m, d] = e.date.split('-').map(Number);
+    const [h, mi] = e.time ? e.time.split(':').map(Number) : [0, 0];
+    const start = new Date(y, m - 1, d, h, mi).getTime();
+    const name = `${e.icon || ''}${e.title || e.place_name || e.category_name}`;
+    const when = e.time || '時刻なし';
+    const add = (at, label) => {
+      if (at <= now) return;
+      jobs.push(hidden
+        ? { at, title: '通院・美容院ノート', body: `予定の${label}です` }
+        : { at, title: name, body: `${fmtDate(e.date)} ${when}${e.place_name && e.place_name !== e.title ? ` ${e.place_name}` : ''}（${label}）` });
+    };
+    // 時刻のない予定は前日 9:00（カレンダー追加のときと同じ）
+    if (alarm >= 0) add(e.time ? start - alarm * 60000 : start - 15 * 3600000, e.time ? alarmLabel() : '前日');
+    if (dayBefore && alarm !== 1440) add(e.time ? start - 86400000 : start - 39 * 3600000, '前日');
+  }
+  return jobs.sort((a, b) => a.at - b.at);
+}
+let pushTimer = null;
+function schedulePushSync() {
+  if (!pushDevice()) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(syncPush, 1500);
+}
+async function syncPush() {
+  const device = pushDevice();
+  if (!device) return;
+  try {
+    const r = await sendJobs(device, await buildPushJobs());
+    await setMeta('push_synced', { at: new Date().toISOString(), count: r.count });
+  } catch (err) {
+    await setMeta('push_synced', { at: new Date().toISOString(), error: err.message });
+  }
+}
+
+function pushSettingsHtml() {
+  const on = !!pushDevice();
+  const synced = getMeta('push_synced');
+  if (!pushSupported() || !isStandalone) {
+    return `<p class="small muted" style="margin:0">ホーム画面の「通院ノート」アイコンから開くと使えます（iOS 16.4 以降）。</p>`;
+  }
+  return `<p class="small" style="margin:0 0 6px">状態: ${on ? '✅ オン' : 'オフ'}${on && synced ? `<span class="muted">（${synced.error ? `⚠️ ${esc(synced.error)}` : `${synced.count}件を予約済み`}）</span>` : ''}</p>
+    ${on ? `<label class="check"><input type="checkbox" data-pushprivate ${getMeta('push_private') ? 'checked' : ''}> 通知に予定名を出さない（「予定の1時間前です」だけにする）</label>
+      <div class="row"><button class="btn" data-pushtest>テスト通知</button><button class="btn danger" data-pushoff style="flex:none">オフにする</button></div>`
+    : '<button class="btn primary block" data-pushon>通知をオンにする</button>'}`;
+}
+function bindPushSettings(view) {
+  $('[data-pushon]', view)?.addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = '設定中…';
+    try {
+      await setMeta('push_device', await enablePush());
+      await syncPush();
+      toast('通知をオンにしました');
+    } catch (err) { alert(err.message); }
+    renderTab();
+  });
+  $('[data-pushtest]', view)?.addEventListener('click', async () => {
+    try { await testPush(pushDevice()); toast('テスト通知を送りました'); } catch (err) { alert(err.message); }
+  });
+  $('[data-pushoff]', view)?.addEventListener('click', async () => {
+    if (!confirm('このアプリからの通知をオフにしますか？')) return;
+    await disablePush(pushDevice());
+    await setMeta('push_device', null);
+    await setMeta('push_synced', null);
+    renderTab();
+  });
+  $('[data-pushprivate]', view)?.addEventListener('change', async (e) => {
+    await setMeta('push_private', e.target.checked);
+    await syncPush();
+    toast('変更しました');
+  });
+}
+
 // ---------------- 行き方（自宅・会社から電車で） ----------------
 const ORIGINS = [
   { key: 'origin_home', icon: '🏠', label: '自宅' },
   { key: 'origin_work', icon: '🏢', label: '会社' },
 ];
+// iPhone の「マップ」で乗り換え（dirflg=r は電車・バス）
 function routeUrl(origin, dest) {
-  const q = new URLSearchParams({ api: '1', origin, destination: dest, travelmode: 'transit' });
-  return `https://www.google.com/maps/dir/?${q}`;
+  const q = new URLSearchParams({ saddr: origin, daddr: dest, dirflg: 'r' });
+  return `https://maps.apple.com/?${q}`;
 }
 // 病院・お店の詳細と予定の詳細に出す「行き方」
 function routeSection(p, arriveTime = '') {
@@ -601,7 +704,7 @@ function routeSection(p, arriveTime = '') {
       style="text-decoration:none;color:inherit;display:inline-flex;align-items:center">${o.icon} ${o.label}から</a>`).join(' ');
   return `<dt>行き方（電車）</dt><dd>
     ${saved.length ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${buttons}</div>
-      <div class="small muted" style="margin-top:4px">Google マップで乗り換えを表示します${arriveTime ? `。${esc(arriveTime)} に着きたいときは、Google マップで「出発時刻」→「到着時刻」を選んでください` : ''}</div>`
+      <div class="small muted" style="margin-top:4px">iPhone の「マップ」で乗り換えを表示します${arriveTime ? `。${esc(arriveTime)} に着きたいときは、マップの経路画面で「今すぐ出発」を押して「到着」の時刻を選んでください` : ''}</div>`
       : '<span class="small muted">「設定」で自宅・会社を登録すると、ここから乗り換えを調べられます</span>'}
     ${p.address ? '' : '<div class="small muted">※住所が未登録なので、名前で検索します</div>'}</dd>`;
 }
@@ -788,7 +891,10 @@ async function renderMaster(view) {
       const list = state.places.filter((p) => p.category_id === c.id);
       return `<div class="month-label"><span class="dot" style="--c:${esc(c.color)}"></span>${esc(c.icon)} ${esc(c.name)}</div>
         <div class="card">${list.map((p) => `<button class="item" data-place="${p.id}" style="--c:${esc(c.color)}"><span class="bar"></span>
-          <span class="body"><div class="t">${esc(p.name)}</div><div class="s">${esc([p.phone, p.url].filter(Boolean).join(' · ') || p.memo)}</div></span></button>`).join('')
+          <span class="body"><div class="t">${esc(p.name)}</div>
+            ${p.address ? `<div class="s">📍 ${esc(p.address)}</div>` : ''}
+            ${p.url ? `<div class="s">🔗 ${esc(p.url)}</div>` : ''}
+            ${!p.address && !p.url && p.memo ? `<div class="s">${esc(p.memo)}</div>` : ''}</span></button>`).join('')
           || '<div class="empty small">未登録</div>'}</div>`;
     }).join('');
   } else if (seg === 'medicines') {
@@ -797,8 +903,14 @@ async function renderMaster(view) {
       <span class="body"><div class="t">${esc(m.name)}</div><div class="s">${esc(m.efficacy || m.place_name || '')}</div></span></button>`).join('')
       || '<div class="empty">薬は未登録です</div>'}</div>`;
   } else {
-    body = `<div class="card">${state.categories.map((c) => `<button class="item" data-cat="${c.id}" style="--c:${esc(c.color)}"><span class="bar"></span>
-      <span class="body"><div class="t">${esc(c.icon)} ${esc(c.name)}</div></span></button>`).join('')}</div>`;
+    const n = state.categories.length;
+    body = `<p class="small muted" style="margin:0 4px 6px">▲▼ で並び順を変えられます（カレンダーの上の並びにも反映されます）</p>
+      <div class="card">${state.categories.map((c, i) => `<div class="item" style="--c:${esc(c.color)};cursor:default">
+      <span class="bar"></span>
+      <button class="body" data-cat="${c.id}" style="border:0;background:none;text-align:left;padding:0;cursor:pointer"><div class="t">${esc(c.icon)} ${esc(c.name)}</div></button>
+      <button class="icon-btn" data-move="${i}" data-dir="-1" aria-label="上へ" ${i === 0 ? 'disabled style="opacity:.25"' : ''}>▲</button>
+      <button class="icon-btn" data-move="${i}" data-dir="1" aria-label="下へ" ${i === n - 1 ? 'disabled style="opacity:.25"' : ''}>▼</button>
+    </div>`).join('')}</div>`;
   }
   view.innerHTML = `<h1 style="margin-bottom:10px">登録情報</h1>
     <div class="seg">
@@ -812,6 +924,15 @@ async function renderMaster(view) {
   $$('[data-place]', view).forEach((b) => b.addEventListener('click', () => openPlaceView(Number(b.dataset.place))));
   $$('[data-med]', view).forEach((b) => b.addEventListener('click', () => openMedicineView(Number(b.dataset.med))));
   $$('[data-cat]', view).forEach((b) => b.addEventListener('click', () => openCategoryEdit(catById(b.dataset.cat))));
+  $$('[data-move]', view).forEach((b) => b.addEventListener('click', async () => {
+    const ids = state.categories.map((c) => c.id);
+    const i = Number(b.dataset.move);
+    const j = i + Number(b.dataset.dir);
+    if (j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    await api('/api/categories/order', { method: 'PUT', body: { ids } });
+    await refresh();
+  }));
   $('[data-add]', view).addEventListener('click', () => {
     if (seg === 'places') openPlaceEdit({ category_id: [...state.filter][0] || state.categories[0]?.id });
     else if (seg === 'medicines') openMedicineEdit({});
@@ -884,7 +1005,7 @@ function openPasteSheet() {
     sheet.innerHTML = `${sheetHead('予定を貼り付け')}
       <p class="small muted" style="margin-top:0">ショートカットでコピーした内容を、下の欄を長押しして「ペースト」してください。</p>
       <div class="field"><textarea data-text style="min-height:200px" placeholder="■2026/10/01 10:00&#10;皮膚科&#10;さくら皮膚科&#10;メモ"></textarea></div>
-      <div class="actions"><button class="btn primary" data-next>次へ</button></div>`;
+      <div class="actions sticky"><button class="btn primary" data-next>次へ</button></div>`;
     bindHead(sheet);
     $('[data-next]', sheet).addEventListener('click', () => {
       const items = parseCalendarText($('[data-text]', sheet).value);
@@ -925,7 +1046,7 @@ async function openCalendarImport(all) {
             <select data-place>${placeOptions(it)}</select>
           </div>
         </div>`).join('') || '<div class="empty">新しく取り込める予定はありません</div>'}</div>
-      <div class="actions"><button class="btn primary" data-go ${count() ? '' : 'disabled'}>選んだ ${count()}件を取り込む</button></div>`;
+      <div class="actions sticky"><button class="btn primary" data-go ${count() ? '' : 'disabled'}>選んだ ${count()}件を取り込む</button></div>`;
     bindHead(sheet);
     const go = $('[data-go]', sheet);
     const refreshCount = () => { const n = count(); go.disabled = !n; go.textContent = `選んだ ${n}件を取り込む`; };
@@ -1000,17 +1121,20 @@ async function renderSettings(view) {
     </div>
     <h2>通知</h2>
     <div class="box">
-      <p class="small muted" style="margin-top:0">予定を iPhone のカレンダーに追加すると、カレンダーから通知が届きます（このアプリを閉じていても届きます）。</p>
       <div class="row" style="align-items:center;margin-bottom:8px"><span style="flex:none">通知のタイミング</span>
         <select data-alarm style="padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card)">
           ${ALARM_OPTIONS.map((o) => `<option value="${o.value}" ${o.value === alarmMinutes() ? 'selected' : ''}>${o.label}</option>`).join('')}</select></div>
       <label class="check"><input type="checkbox" data-daybefore ${getMeta('alarm_day_before') ? 'checked' : ''}> 前日にも通知する</label>
-      <p class="small muted">時刻のない予定は、前日の 9:00 に通知します。</p>
-      <button class="btn primary block" data-bulkcal>これからの予定をまとめて追加</button>
+      <p class="small muted" style="margin:0">時刻のない予定は、前日の 9:00 に通知します。</p>
+      <h3 style="font-size:14px;margin:14px 0 4px">このアプリから通知する</h3>
+      ${pushSettingsHtml()}
+      <h3 style="font-size:14px;margin:14px 0 4px">iPhone のカレンダーに追加して通知する</h3>
+      <p class="small muted" style="margin:0 0 6px">アプリからの通知が使えないときの方法です。</p>
+      <button class="btn block" data-bulkcal>これからの予定をまとめて追加</button>
     </div>
     <h2>自宅・会社（乗り換え検索の出発地）</h2>
     <div class="box">
-      <p class="small muted" style="margin-top:0">登録すると、病院・お店や予定の画面から、ここまでの電車の乗り換えを Google マップで調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
+      <p class="small muted" style="margin-top:0">登録すると、病院・お店や予定の画面から、ここまでの電車の乗り換えを iPhone の「マップ」で調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
       ${ORIGINS.map((o) => `<div class="field" style="margin-bottom:10px"><label>${o.icon} ${o.label}</label>
         <div class="row"><input data-origin="${o.key}" value="${esc(getMeta(o.key) || '')}" placeholder="例: 東京都渋谷区… / 渋谷駅"
           style="padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:16px">
@@ -1077,8 +1201,9 @@ async function renderSettings(view) {
     }
   });
 
-  $('[data-alarm]', view).addEventListener('change', async (e) => { await setMeta('alarm_min', Number(e.target.value)); toast('変更しました'); });
-  $('[data-daybefore]', view).addEventListener('change', async (e) => { await setMeta('alarm_day_before', e.target.checked); toast('変更しました'); });
+  $('[data-alarm]', view).addEventListener('change', async (e) => { await setMeta('alarm_min', Number(e.target.value)); schedulePushSync(); toast('変更しました'); });
+  $('[data-daybefore]', view).addEventListener('change', async (e) => { await setMeta('alarm_day_before', e.target.checked); schedulePushSync(); toast('変更しました'); });
+  bindPushSettings(view);
   // 予定の読み込みを先に済ませ、タップ直後にファイルを開けるようにしておく
   let pending = await upcomingNotExported();
   const bulk = $('[data-bulkcal]', view);
@@ -1139,6 +1264,7 @@ async function renderSettings(view) {
       const r = await importBackup(f);
       await setMeta('last_backup', new Date().toISOString());
       toast(`復元しました（予定 ${r.events}件・写真 ${r.photos}枚）`);
+      schedulePushSync();
       await refresh();
     } catch (err) { alert(`復元できませんでした: ${err.message}`); }
   });
@@ -1150,11 +1276,13 @@ async function renderTab() {
   const view = $('#view');
   try {
     await renderers[state.tab](view);
-    if (state.tab === 'calendar' || state.tab === 'list') {
-      if (state.tab === 'calendar') view.insertAdjacentHTML('afterbegin', await soonBanner());
+    if (state.tab === 'calendar') view.insertAdjacentHTML('afterbegin', await soonBanner());
+    if (state.tab === 'list') {
       view.insertAdjacentHTML('afterbegin', backupBanner());
       $('[data-gobackup]', view)?.addEventListener('click', goSettings);
     }
+    // カレンダーには出さず、「設定」タブに小さな印だけ付ける
+    $('.tabbar [data-tab=settings]').classList.toggle('due', backupDue());
     view.insertAdjacentHTML('afterbegin', placeWarning());
   } catch (err) {
     view.innerHTML = `<div class="empty">読み込みに失敗しました: ${esc(err.message)}</div>`;
@@ -1170,6 +1298,46 @@ $$('.tabbar button').forEach((b) => b.addEventListener('click', () => {
 // オフラインでも開けるようにする
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 
-openStore().then(refresh).catch((err) => {
+// ---------------- 初回だけのパスワード ----------------
+// ※ 公開ファイルに含まれるので本格的な鍵ではない（データはもともと端末の外に出ない）
+const PASS_HASH = 'c8ace20a55c88e4d1fc94009b763c6690efa764f5e6497cc736acf069b1fbc82';
+async function sha256(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+function showLock() {
+  return new Promise((resolve) => {
+    document.querySelector('.tabbar').hidden = true;
+    const view = $('#view');
+    view.innerHTML = `<div style="max-width:320px;margin:15vh auto 0;text-align:center">
+      <img src="icon.svg" alt="" width="72" height="72" style="border-radius:16px">
+      <h1 style="margin:12px 0 4px">通院・美容院ノート</h1>
+      <p class="small muted">最初に一度だけ、パスワードを入力してください</p>
+      <form data-lock><input type="password" inputmode="numeric" autocomplete="off" name="pw" placeholder="パスワード"
+        style="width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:20px;text-align:center;letter-spacing:6px">
+        <button class="btn primary block" style="margin-top:10px">はじめる</button>
+        <p data-err class="small" style="color:var(--danger)" hidden>パスワードが違います</p></form>
+    </div>`;
+    const form = $('[data-lock]', view);
+    form.pw.focus();
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (await sha256(form.pw.value.trim()) === PASS_HASH) {
+        await setMeta('unlocked', true);
+        document.querySelector('.tabbar').hidden = false;
+        resolve();
+      } else {
+        $('[data-err]', view).hidden = false;
+        form.pw.value = '';
+      }
+    });
+  });
+}
+
+openStore().then(async () => {
+  if (!getMeta('unlocked')) await showLock();
+  await refresh();
+  schedulePushSync(); // 開くたびに通知の予約を最新にする（日付が進んだ分など）
+}).catch((err) => {
   $('#view').innerHTML = `<div class="empty">データを開けませんでした: ${esc(err.message)}<br>プライベートブラウズでは使えません。</div>`;
 });

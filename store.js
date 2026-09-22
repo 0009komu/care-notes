@@ -151,6 +151,16 @@ route('POST', '/api/categories', async (_, b) => {
   const sort = Math.max(0, ...mem.categories.map((c) => c.sort)) + 1;
   return { id: await insert('categories', { name, color: str(b.color) || '#0f766e', icon: str(b.icon), sort }) };
 });
+// 並び順の変更: ids の順に sort を振り直す
+route('PUT', '/api/categories/order', async (_, b) => {
+  const ids = (Array.isArray(b.ids) ? b.ids : []).map(Number);
+  for (const c of mem.categories) {
+    const i = ids.indexOf(c.id);
+    const sort = i < 0 ? ids.length + c.sort : i + 1;
+    if (c.sort !== sort) { c.sort = sort; await save('categories', c); }
+  }
+  return { ok: true };
+});
 route('PUT', '/api/categories/:id', async ([id], b) => {
   const c = find('categories', id);
   Object.assign(c, { name: str(b.name) || bad('カテゴリ名を入力してください'), color: str(b.color) || '#0f766e', icon: str(b.icon) });

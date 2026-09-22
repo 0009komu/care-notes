@@ -705,6 +705,22 @@ function backupBanner() {
     <span style="flex:1">⚠️ ${d === null ? 'まだバックアップしていません' : `前回のバックアップから${d}日たちました`}</span>
     <button class="btn primary" data-gobackup style="flex:none">バックアップ</button></div>`;
 }
+// ホーム画面のアイコン以外（Safari・アプリ内ブラウザ）で開いているか
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+function placeWarning() {
+  if (!isIOS || isStandalone) return '';
+  return `<div class="box" style="border:2px solid var(--danger);margin-bottom:12px">
+    <b style="color:var(--danger)">⚠️ ここで入力したデータは、ホーム画面のアプリには保存されません</b>
+    <p class="small" style="margin:6px 0 0">いまは Safari または他のアプリの中で開いています。必ず<b>ホーム画面の「通院ノート」アイコン</b>から開いて使ってください。</p>
+    <details class="small" style="margin-top:6px"><summary style="color:var(--accent);cursor:pointer">ホーム画面に追加する方法</summary>
+      <ol style="padding-left:20px;margin:6px 0 0;line-height:1.7">
+        <li><b>Safari</b> で https://0009komu.github.io/care-notes/ を開く（Claude などのアプリ内で開いている場合は、右下などの「Safariで開く」を押す）</li>
+        <li>下の共有ボタン（□↑）→「ホーム画面に追加」→「追加」</li>
+        <li>ホーム画面にできた「通院ノート」アイコンから開く</li>
+      </ol></details>
+  </div>`;
+}
 function goSettings() {
   state.tab = 'settings';
   $$('.tabbar button').forEach((x) => x.classList.toggle('active', x.dataset.tab === 'settings'));
@@ -932,6 +948,7 @@ async function renderTab() {
       view.insertAdjacentHTML('afterbegin', backupBanner());
       $('[data-gobackup]', view)?.addEventListener('click', goSettings);
     }
+    view.insertAdjacentHTML('afterbegin', placeWarning());
   } catch (err) {
     view.innerHTML = `<div class="empty">読み込みに失敗しました: ${esc(err.message)}</div>`;
   }

@@ -312,7 +312,8 @@ function openEventView(id) {
         ${p ? `<dt>病院・お店</dt><dd><a href="#" data-place="${p.id}">${esc(p.name)}</a>
           ${p.url ? `<br><a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.url)}</a>` : ''}
           ${p.phone ? `<br>📞 <a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>` : ''}
-          ${p.address ? `<br>📍 <a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a>` : ''}</dd>` : ''}
+          ${p.address ? `<br>📍 <a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a>` : ''}</dd>
+          ${routeSection(p, e.time)}` : ''}
         ${e.memo ? `<dt>メモ</dt><dd class="pre">${esc(e.memo)}</dd>` : ''}
         ${e.medicines.length ? `<dt>薬</dt><dd><div class="box">${e.medicines.map((m) => `
           <div class="med-row" data-med="${m.id}" style="cursor:pointer">
@@ -466,6 +467,7 @@ function openPlaceView(id) {
         ${p.url ? `<dt>URL</dt><dd><a href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">${esc(p.url)}</a></dd>` : ''}
         ${p.phone ? `<dt>電話</dt><dd><a href="tel:${esc(p.phone)}">${esc(p.phone)}</a></dd>` : ''}
         ${p.address ? `<dt>住所</dt><dd><a href="https://maps.google.com/?q=${encodeURIComponent(p.address)}" target="_blank" rel="noopener">${esc(p.address)}</a></dd>` : ''}
+        ${routeSection(p)}
         ${p.memo ? `<dt>メモ</dt><dd class="pre">${esc(p.memo)}</dd>` : ''}
         ${p.photos.length ? `<dt>写真</dt><dd>${photoGrid(p.photos)}</dd>` : ''}
         ${p.medicines.length ? `<dt>この病院の薬</dt><dd>${p.medicines.map((m) => `<a href="#" data-med="${m.id}">💊 ${esc(m.name)}</a>`).join('<br>')}</dd>` : ''}
@@ -534,6 +536,29 @@ function openPlaceEdit(p, onCreated) {
       } catch (err) { alert(err.message); }
     });
   });
+}
+
+// ---------------- 行き方（自宅・会社から電車で） ----------------
+const ORIGINS = [
+  { key: 'origin_home', icon: '🏠', label: '自宅' },
+  { key: 'origin_work', icon: '🏢', label: '会社' },
+];
+function routeUrl(origin, dest) {
+  const q = new URLSearchParams({ api: '1', origin, destination: dest, travelmode: 'transit' });
+  return `https://www.google.com/maps/dir/?${q}`;
+}
+// 病院・お店の詳細と予定の詳細に出す「行き方」
+function routeSection(p, arriveTime = '') {
+  const dest = p.address || p.name;
+  if (!dest) return '';
+  const saved = ORIGINS.filter((o) => getMeta(o.key));
+  const buttons = saved.map((o) => `<a class="btn" href="${esc(routeUrl(getMeta(o.key), dest))}" target="_blank" rel="noopener"
+      style="text-decoration:none;color:inherit;display:inline-flex;align-items:center">${o.icon} ${o.label}から</a>`).join(' ');
+  return `<dt>行き方（電車）</dt><dd>
+    ${saved.length ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${buttons}</div>
+      <div class="small muted" style="margin-top:4px">Google マップで乗り換えを表示します${arriveTime ? `。${esc(arriveTime)} に着きたいときは、Google マップで「出発時刻」→「到着時刻」を選んでください` : ''}</div>`
+      : '<span class="small muted">「設定」で自宅・会社を登録すると、ここから乗り換えを調べられます</span>'}
+    ${p.address ? '' : '<div class="small muted">※住所が未登録なので、名前で検索します</div>'}</dd>`;
 }
 
 // 名前から Google で住所・URL・電話番号を探す
@@ -928,6 +953,15 @@ async function renderSettings(view) {
         ${SHORTCUT_HELP}
       </details>
     </div>
+    <h2>自宅・会社（乗り換え検索の出発地）</h2>
+    <div class="box">
+      <p class="small muted" style="margin-top:0">登録すると、病院・お店や予定の画面から、ここまでの電車の乗り換えを Google マップで調べられます。住所・駅名・建物名のどれでも大丈夫です。この iPhone の中にだけ保存されます。</p>
+      ${ORIGINS.map((o) => `<div class="field" style="margin-bottom:10px"><label>${o.icon} ${o.label}</label>
+        <div class="row"><input data-origin="${o.key}" value="${esc(getMeta(o.key) || '')}" placeholder="例: 東京都渋谷区… / 渋谷駅"
+          style="padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);font-size:16px">
+          <button class="btn" data-originlookup="${o.key}" style="flex:none">🔍</button></div></div>`).join('')}
+      <button class="btn primary block" data-saveorigins>保存</button>
+    </div>
     <h2>Google の場所検索</h2>
     <div class="box">
       <p class="small muted" style="margin-top:0">病院・お店の名前から住所・URL・電話番号を入れるための API キーです。キーはこの iPhone の中にだけ保存されます。</p>
@@ -987,6 +1021,19 @@ async function renderSettings(view) {
       if (err.name !== 'AbortError') alert(err.message);
     }
   });
+
+  $('[data-saveorigins]', view).addEventListener('click', async () => {
+    for (const inp of $$('[data-origin]', view)) await setMeta(inp.dataset.origin, inp.value.trim());
+    toast('保存しました');
+  });
+  $$('[data-originlookup]', view).forEach((b) => b.addEventListener('click', () => {
+    const inp = $(`[data-origin="${b.dataset.originlookup}"]`, view);
+    if (!inp.value.trim()) { alert('先に建物名や駅名などを入力してください'); return; }
+    openPlaceLookup(inp.value.trim(), async (hit) => {
+      await setMeta(b.dataset.originlookup, hit.address || hit.name);
+      renderTab();
+    });
+  }));
 
   $('[data-savekey]', view).addEventListener('click', async () => {
     const v = $('[data-key]', view).value.trim();

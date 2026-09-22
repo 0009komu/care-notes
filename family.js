@@ -1,6 +1,6 @@
 // 家族共有：共有にした予定（日付・時間・タイトルだけ）を、招待コードから作った鍵で暗号化して預ける。
 // サーバーには招待コードそのものは送らず、コードから作った groupId と、暗号化した中身だけを送る。
-import { PUSH_SERVER } from './push.js';
+import { serverCall } from './push.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -38,12 +38,7 @@ async function open(key, blob) {
   return JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, key, unb64(ct))));
 }
 
-async function call(path, body) {
-  const res = await fetch(PUSH_SERVER + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `共有サーバーのエラー (${res.status})`);
-  return data;
-}
+const call = (path, body) => serverCall('POST', path, body);
 
 // create=true でグループを新しく作る。戻り値は端末に保存する
 export async function joinFamily(code, create = false) {

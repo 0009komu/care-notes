@@ -1,6 +1,10 @@
 // OurTime（iPhone 版・データは端末内に保存）
 import { openStore, api as storeApi, photoUrl, getMeta, setMeta, stats, exportBackup, importBackup } from './store.js';
-import { pushSupported, enablePush, sendJobs, testPush, disablePush } from './push.js';
+import { pushSupported, enablePush, sendJobs, testPush, disablePush, setClientProvider, claimOwner, redeemPairCode, issuePairCode, listClients, removeClient } from './push.js';
+
+// 通知・家族共有サーバーは「承認済みの端末」だけが使える
+setClientProvider(() => getMeta('server_client'));
+const approved = () => !!getMeta('server_client');
 import { MEMBER_COLORS, newInviteCode, normalizeCode, joinFamily, pushFamily, pullFamily, leaveFamily } from './family.js';
 
 // 予定が変わったら通知サーバーの予約と家族共有も更新する
@@ -17,7 +21,7 @@ async function api(path, opts = {}) {
 const family = () => getMeta('family');
 let familyTimer = null;
 function scheduleFamilyPush() {
-  if (!family()) return;
+  if (!family() || !approved()) return;
   clearTimeout(familyTimer);
   familyTimer = setTimeout(() => syncFamily(true), 1500);
 }
@@ -41,7 +45,7 @@ async function syncFamily(pushOnly = false) {
 }
 let lastPull = 0;
 async function pullFamilyIfStale() {
-  if (!family() || Date.now() - lastPull < 60000) return false;
+  if (!family() || !approved() || Date.now() - lastPull < 60000) return false;
   lastPull = Date.now();
   await syncFamily();
   return true;
@@ -732,7 +736,7 @@ async function buildPushJobs() {
 }
 let pushTimer = null;
 function schedulePushSync() {
-  if (!pushDevice()) return;
+  if (!pushDevice() || !approved()) return;
   clearTimeout(pushTimer);
   pushTimer = setTimeout(syncPush, 1500);
 }
@@ -747,10 +751,83 @@ async function syncPush() {
   }
 }
 
+// ---------------- 端末登録（承認） ----------------
+// 以前から通知を使っている端末は、最初の持ち主として自動で登録する
+async function autoClaimOwner() {
+  if (approved() || !pushDevice()) return;
+  try {
+    const { client } = await claimOwner(pushDevice(), '持ち主の iPhone');
+    await setMeta('server_client', client);
+  } catch { /* すでに持ち主がいる場合などは、登録コードで登録してもらう */ }
+}
+function deviceSettingsHtml() {
+  const inputStyle = 'padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:var(--card)';
+  if (!approved()) {
+    return `<p class="small muted" style="margin-top:0">通知と家族共有は、登録した iPhone だけが使えます（知らない人に使われないようにするため）。
+        すでに登録済みの iPhone の「設定」→「端末登録」で<b>登録コード</b>を発行し、ここに入力してください。</p>
+      <div class="field"><label>この iPhone の名前</label><input data-devname maxlength="20" placeholder="例: はなこの iPhone" style="width:100%;${inputStyle}"></div>
+      <div class="row"><input data-paircode placeholder="登録コード（XXXX-XXXX）" autocapitalize="characters" autocomplete="off" style="${inputStyle}">
+        <button class="btn primary" data-redeem style="flex:none">登録</button></div>
+      ${pushDevice() ? '<button class="btn block" data-claim style="margin-top:8px">この iPhone を持ち主として登録する</button>' : ''}`;
+  }
+  return `<p class="small" style="margin-top:0">✅ この iPhone は登録済みです。</p>
+    <div data-pairbox></div>
+    <button class="btn block" data-newpair>ほかの iPhone を追加する（登録コードを発行）</button>
+    <details style="margin-top:8px" data-clients><summary class="small" style="cursor:pointer;color:var(--accent)">登録済みの iPhone</summary><div data-clientlist class="small">読み込み中…</div></details>`;
+}
+function bindDeviceSettings(view) {
+  $('[data-redeem]', view)?.addEventListener('click', async () => {
+    const name = $('[data-devname]', view).value.trim() || 'iPhone';
+    const code = $('[data-paircode]', view).value.trim();
+    if (!code) { alert('登録コードを入力してください'); return; }
+    try {
+      const { client } = await redeemPairCode(code, name);
+      await setMeta('server_client', client);
+      toast('この iPhone を登録しました');
+    } catch (err) { alert(err.message); }
+    renderTab();
+  });
+  $('[data-claim]', view)?.addEventListener('click', async () => {
+    try {
+      const { client } = await claimOwner(pushDevice(), '持ち主の iPhone');
+      await setMeta('server_client', client);
+      toast('持ち主として登録しました');
+    } catch (err) { alert(err.message); }
+    renderTab();
+  });
+  $('[data-newpair]', view)?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      const { code, expires } = await issuePairCode();
+      $('[data-pairbox]', view).innerHTML = `<div class="box" style="margin-bottom:8px;text-align:center">
+        <div class="small muted">追加する iPhone の「設定」→「端末登録」で入力してください</div>
+        <div style="font-size:26px;font-weight:700;letter-spacing:3px;font-family:monospace;margin:4px 0">${esc(code)}</div>
+        <div class="small muted">${new Date(expires).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} まで有効・1回だけ使えます</div></div>`;
+    } catch (err) { alert(err.message); }
+    e.target.disabled = false;
+  });
+  $('[data-clients]', view)?.addEventListener('toggle', async (e) => {
+    if (!e.target.open) return;
+    const box = $('[data-clientlist]', view);
+    try {
+      const { clients } = await listClients();
+      box.innerHTML = clients.map((c) => `<div class="row" style="align-items:center;padding:4px 0">
+        <span>📱 ${esc(c.name)}${c.me ? '（この iPhone）' : ''}<br><span class="muted">${new Date(c.added).toLocaleDateString('ja-JP')} に登録</span></span>
+        ${c.me ? '' : `<button class="btn danger" data-rmclient="${esc(c.id)}" style="flex:none">解除</button>`}</div>`).join('');
+      $$('[data-rmclient]', box).forEach((b) => b.addEventListener('click', async () => {
+        if (!confirm('この iPhone の登録を解除しますか？（通知と家族共有が使えなくなります）')) return;
+        await removeClient(b.dataset.rmclient);
+        e.target.open = false; e.target.open = true;
+      }));
+    } catch (err) { box.textContent = err.message; }
+  });
+}
+
 const fmtCode = (c) => normalizeCode(c).match(/.{1,4}/g)?.join('-') || '';
 function familySettingsHtml() {
   const fam = family();
   const inputStyle = 'padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:var(--card)';
+  if (!fam && !approved()) return '<p class="small muted" style="margin:0">先に上の「📱 端末登録」でこの iPhone を登録してください。</p>';
   if (!fam) {
     return `<p class="small muted" style="margin-top:0">「家族と共有」にした予定の <b>日付・時間・内容</b> だけを家族に見せられます（家族は見るだけ）。カテゴリ・病院名・薬・写真・メモは共有しません。予定は暗号化して送るので、サーバーの管理者にも中身は読めません。</p>
       <div class="field"><label>あなたの表示名（家族に見える名前）</label><input data-famname maxlength="10" placeholder="例: たつや" style="width:100%;${inputStyle}"></div>
@@ -822,6 +899,7 @@ function pushSettingsHtml() {
   if (!pushSupported() || !isStandalone) {
     return `<p class="small muted" style="margin:0">ホーム画面の「OurTime」アイコンから開くと使えます（iOS 16.4 以降）。</p>`;
   }
+  if (!approved()) return '<p class="small muted" style="margin:0">先に上の「📱 端末登録」でこの iPhone を登録してください。</p>';
   return `<p class="small" style="margin:0 0 6px">状態: ${on ? '✅ オン' : 'オフ'}${on && synced ? `<span class="muted">（${synced.error ? `⚠️ ${esc(synced.error)}` : `${synced.count}件を予約済み`}）</span>` : ''}</p>
     ${on ? `<label class="check"><input type="checkbox" data-pushprivate ${getMeta('push_private') ? 'checked' : ''}> 通知に予定名を出さない（「予定の1時間前です」だけにする）</label>
       <div class="row"><button class="btn" data-pushtest>テスト通知</button><button class="btn danger" data-pushoff style="flex:none">オフにする</button></div>`
@@ -1329,6 +1407,8 @@ async function renderSettings(view) {
         ${SHORTCUT_HELP}
       </details>
     </div>
+    <h2>📱 端末登録</h2>
+    <div class="box">${deviceSettingsHtml()}</div>
     <h2>通知</h2>
     <div class="box">
       <div class="row" style="align-items:center;margin-bottom:8px"><span style="flex:none">通知のタイミング</span>
@@ -1423,6 +1503,7 @@ async function renderSettings(view) {
   $('[data-daybefore]', view).addEventListener('change', async (e) => { await setMeta('alarm_day_before', e.target.checked); schedulePushSync(); toast('変更しました'); });
   bindPushSettings(view);
   bindFamilySettings(view);
+  bindDeviceSettings(view);
   // 予定の読み込みを先に済ませ、タップ直後にファイルを開けるようにしておく
   let pending = await upcomingNotExported();
   const bulk = $('[data-bulkcal]', view);
@@ -1579,6 +1660,7 @@ function showLock() {
 
 openStore().then(async () => {
   if (!getMeta('unlocked')) await showLock();
+  await autoClaimOwner(); // 以前から通知を使っている端末は、持ち主として自動で登録
   await refresh();
   schedulePushSync(); // 開くたびに通知の予約を最新にする（日付が進んだ分など）
 }).catch((err) => {

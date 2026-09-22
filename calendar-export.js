@@ -39,12 +39,16 @@ function veventLines(e, { alarm = 60, dayBefore = false, durationMin = 60 } = {}
   const [y, m, d] = e.date.split('-').map(Number);
   const title = `${e.icon || ''}${e.title || e.place_name || e.category_name || '予定'}`;
   const place = e.place;
+  const DOW = ['日', '月', '火', '水', '木', '金', '土'];
+  const url = place?.url ? (/^https?:\/\//i.test(place.url) ? place.url : `https://${place.url}`) : '';
+  const content = [e.title, e.place_name && e.place_name !== e.title ? e.place_name : '', e.memo].filter(Boolean).join('\n');
+  // カレンダーで予定を開いたときに読む欄（電話番号は入れない）
   const details = [
-    e.place_name && e.title ? e.place_name : '',
-    place?.phone ? `電話: ${place.phone}` : '',
-    place?.url || '',
-    e.memo || '',
-    ...(e.medicines || []).map((x) => `薬: ${x.name}${x.note ? `（${x.note}）` : ''}`),
+    `日付: ${y}年${m}月${d}日（${DOW[new Date(y, m - 1, d).getDay()]}）`,
+    `時間: ${e.time || '時刻なし'}`,
+    content && `内容: ${content}`,
+    url && `URL: ${url}`,
+    place?.address && `住所: ${place.address}`,
   ].filter(Boolean).join('\n');
   const lines = ['BEGIN:VEVENT', `UID:care-${e.id}@care-notes`, `DTSTAMP:${utc(new Date())}`];
   if (e.time) {
@@ -58,7 +62,8 @@ function veventLines(e, { alarm = 60, dayBefore = false, durationMin = 60 } = {}
   }
   lines.push(`SUMMARY:${esc(title)}`);
   if (place?.address || e.place_name) lines.push(`LOCATION:${esc(place?.address || e.place_name)}`);
-  if (details) lines.push(`DESCRIPTION:${esc(details)}`);
+  lines.push(`DESCRIPTION:${esc(details)}`);
+  if (url) lines.push(`URL:${url}`);
   const alarms = [];
   // 時刻のない予定は、その日の 0:00 が基準になるので「前日 9:00」に通知する
   if (alarm >= 0) alarms.push(e.time ? `-PT${alarm}M` : '-PT15H');

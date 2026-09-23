@@ -1276,7 +1276,7 @@ function backupBanner() {
 }
 // ---------------- アプリの更新 ----------------
 // sw.js の VERSION と同じ値にしておく（公開のたびに上げる）
-const APP_VERSION = 'v18';
+const APP_VERSION = 'v19';
 let newVersion = null;
 // 公開されている版を調べる（キャッシュを使わずに取得）
 async function checkUpdate() {

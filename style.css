@@ -117,6 +117,7 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
 }
 .pill.done { color: var(--muted); }
 /* 家族の予定は点線の枠で区別する */
+.pill.gomi { background: color-mix(in srgb, #57534e 18%, transparent); border-left-color: #57534e; color: var(--text); }
 .pill.fam { background: transparent; border: 1px dashed var(--c); border-left: 3px solid var(--c); }
 .item.fam .bar { background: repeating-linear-gradient(var(--c) 0 4px, transparent 4px 7px); }
 .more { font-size: 10px; color: var(--muted); padding-left: 2px; }

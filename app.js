@@ -62,6 +62,12 @@ import { parseCalendarText, guessCategory } from './import-cal.js';
 import { searchPlaces } from './places.js';
 import { ALARM_OPTIONS, buildIcs, openIcs, shareIcs } from './calendar-export.js';
 import { holidayName } from './holidays.js';
+import { gomiOut, gomiCollect, GOMI_RANGE, GOMI_SOURCE } from './gomi.js';
+
+// ごみの日（前日の夜に出す前提で1日前に表示）
+const gomiOn = () => getMeta('gomi_on') !== false;
+const gomiFor = (dateStr) => (gomiOn() ? gomiOut(dateStr) : []);
+const GOMI_SHORT = { 燃やせるごみ: '燃やせる', 燃やせないごみ: '燃やせない', プラ容器包装: 'プラ', ペットボトル: 'ペット', 紙ごみ: '紙', リチウムイオン電池: '電池' };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -77,6 +83,10 @@ function fmtDate(s, withDow = true) {
 function fmtLongDate(s) {
   const [y, m, d] = s.split('-').map(Number);
   return `${y}年${m}月${d}日（${DOW[new Date(y, m - 1, d).getDay()]}）`;
+}
+function addDays(dateStr, n) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return ymd(new Date(y, m - 1, d + n));
 }
 const safeUrl = (u) => (/^https?:\/\//i.test(u) ? u : u ? `https://${u}` : '');
 
@@ -263,6 +273,7 @@ async function renderCalendar(view) {
       (d.getDay() === 0 || hol) && 'sun', d.getDay() === 6 && !hol && 'sat'].filter(Boolean).join(' ');
     cells += `<button class="${cls}" data-date="${ds}"><span class="daytop"><span class="num">${d.getDate()}</span>${hol ? `<span class="hol">${esc(hol)}</span>` : ''}</span>
       ${[...list.map((e) => `<span class="pill ${e.done ? 'done' : ''}" style="--c:${esc(e.color)}">${esc(e.icon)}${esc(e.place_name || e.title || e.category_name)}</span>`), ...fam.map(famPill)].slice(0, 3).join('')}
+      ${gomiFor(ds).length ? `<span class="pill gomi">🗑️${esc(gomiFor(ds).map((t) => GOMI_SHORT[t] || t).join('・'))}</span>` : ''}
       ${list.length + fam.length > 3 ? `<span class="more">+${list.length + fam.length - 3}</span>` : ''}</button>`;
     if (i === 34 && d >= new Date(m.getFullYear(), m.getMonth() + 1, 0)) break; // 5週で収まる月
   }
@@ -284,6 +295,9 @@ async function renderCalendar(view) {
       <div class="cal-grid">${cells}</div>
     </div>
     <h2>${fmtLongDate(state.selected)}${holidayName(state.selected) ? ` <span style="color:#dc2626">${esc(holidayName(state.selected))}</span>` : ''}</h2>
+    ${gomiFor(state.selected).length ? `<div class="box" style="margin-bottom:10px;border-color:#57534e">
+      🗑️ <b>今夜出す: ${esc(gomiFor(state.selected).join('・'))}</b>
+      <div class="small muted">（翌${fmtDate(addDays(state.selected, 1))}の朝 5:00〜8:30 に収集）</div></div>` : ''}
     <div class="card">${dayEvents.length || dayFam.length ? dayEvents.map((e) => eventItem(e)).join('') + dayFam.map(famItem).join('') : '<div class="empty">予定はありません</div>'}</div>
     <button class="fab" data-add aria-label="予定を追加">＋</button>`;
   // 家族の予定は1分以上たっていれば取り直して描き直す
@@ -731,6 +745,18 @@ async function buildPushJobs() {
     // 時刻のない予定は前日 9:00（カレンダー追加のときと同じ）
     if (alarm >= 0) add(e.time ? start - alarm * 60000 : start - 15 * 3600000, e.time ? alarmLabel() : '前日');
     if (dayBefore && alarm !== 1440) add(e.time ? start - 86400000 : start - 39 * 3600000, '前日');
+  }
+  // ごみを出す前夜の通知
+  if (getMeta('gomi_notify')) {
+    const [gh, gm] = (getMeta('gomi_time') || '20:00').split(':').map(Number);
+    for (let i = 0; i < 90; i++) {
+      const day = addDays(todayStr(), i);
+      const types = gomiOut(day);
+      if (!types.length) continue;
+      const [y, mo, d] = day.split('-').map(Number);
+      const at = new Date(y, mo - 1, d, gh, gm).getTime();
+      if (at > now) jobs.push({ at, title: '🗑️ ごみを出す日', body: `${types.join('・')}（明日 ${fmtDate(addDays(day, 1))} の朝に収集）` });
+    }
   }
   return jobs.sort((a, b) => a.at - b.at);
 }
@@ -1422,6 +1448,17 @@ async function renderSettings(view) {
       <p class="small muted" style="margin:0 0 6px">アプリからの通知が使えないときの方法です。</p>
       <button class="btn block" data-bulkcal>これからの予定をまとめて追加</button>
     </div>
+    <h2>🗑️ ごみの日（大津市 栄町）</h2>
+    <div class="box">
+      <label class="check"><input type="checkbox" data-gomion ${gomiOn() ? 'checked' : ''}> カレンダーに表示する</label>
+      <p class="small muted" style="margin:0 0 8px">前日の夜に出す前提で、<b>収集日の1日前</b>に表示します（例: 金曜の朝に収集 → 木曜に表示）。</p>
+      <div class="row" style="align-items:center">
+        <label class="check" style="flex:1"><input type="checkbox" data-gominotify ${getMeta('gomi_notify') ? 'checked' : ''}> 前夜に通知する</label>
+        <select data-gomitime style="flex:0 0 100px">${['18:00', '19:00', '20:00', '21:00', '22:00'].map((t) => `<option ${t === (getMeta('gomi_time') || '20:00') ? 'selected' : ''}>${t}</option>`).join('')}</select>
+      </div>
+      <p class="small muted" style="margin:6px 0 0">収集日のデータ: ${esc(GOMI_RANGE.first.replaceAll('-', '/'))}〜${esc(GOMI_RANGE.last.replaceAll('-', '/'))}（大津市の
+        <a href="${esc(GOMI_SOURCE)}" target="_blank" rel="noopener">ごみ収集カレンダー</a>より）。期間が終わる前に入れ替えが必要です。</p>
+    </div>
     <h2>👪 家族と共有</h2>
     <div class="box">${familySettingsHtml()}</div>
     <h2>乗り換え検索の出発地（自宅・会社など）</h2>
@@ -1504,6 +1541,9 @@ async function renderSettings(view) {
   bindPushSettings(view);
   bindFamilySettings(view);
   bindDeviceSettings(view);
+  $('[data-gomion]', view).addEventListener('change', async (e) => { await setMeta('gomi_on', e.target.checked); toast('変更しました'); });
+  $('[data-gominotify]', view).addEventListener('change', async (e) => { await setMeta('gomi_notify', e.target.checked); schedulePushSync(); toast('変更しました'); });
+  $('[data-gomitime]', view).addEventListener('change', async (e) => { await setMeta('gomi_time', e.target.value); schedulePushSync(); toast('変更しました'); });
   // 予定の読み込みを先に済ませ、タップ直後にファイルを開けるようにしておく
   let pending = await upcomingNotExported();
   const bulk = $('[data-bulkcal]', view);

@@ -1274,6 +1274,34 @@ function backupBanner() {
     <span style="flex:1">⚠️ ${d === null ? 'まだバックアップしていません' : `前回のバックアップから${d}日たちました`}</span>
     <button class="btn primary" data-gobackup style="flex:none">バックアップ</button></div>`;
 }
+// ---------------- アプリの更新 ----------------
+// sw.js の VERSION と同じ値にしておく（公開のたびに上げる）
+const APP_VERSION = 'v18';
+let newVersion = null;
+// 公開されている版を調べる（キャッシュを使わずに取得）
+async function checkUpdate() {
+  try {
+    const text = await fetch(`./sw.js?ts=${Date.now()}`, { cache: 'no-store' }).then((r) => r.text());
+    const m = text.match(/VERSION = '([^']+)'/);
+    newVersion = m && m[1] !== APP_VERSION ? m[1] : null;
+  } catch { newVersion = null; }
+  return newVersion;
+}
+// 保存してあるファイルを消してから開き直す
+async function forceUpdate() {
+  try {
+    for (const k of await caches.keys()) await caches.delete(k);
+    for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  } catch { /* 消せなくても読み込み直す */ }
+  location.replace(`${location.pathname}?u=${Date.now()}`);
+}
+function updateBanner() {
+  if (!newVersion) return '';
+  return `<div class="box" style="margin-bottom:12px;border-color:var(--accent);display:flex;gap:8px;align-items:center">
+    <span style="flex:1">🆕 新しい版があります（${esc(newVersion)}）</span>
+    <button class="btn primary" data-doupdate style="flex:none">更新する</button></div>`;
+}
+
 // ホーム画面のアイコン以外（Safari・アプリ内ブラウザ）で開いているか
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
@@ -1448,6 +1476,12 @@ async function renderSettings(view) {
       <p class="small muted" style="margin:0 0 6px">アプリからの通知が使えないときの方法です。</p>
       <button class="btn block" data-bulkcal>これからの予定をまとめて追加</button>
     </div>
+    <h2>アプリの更新</h2>
+    <div class="box">
+      <p class="small" style="margin-top:0">今の版: <b>${esc(APP_VERSION)}</b>${newVersion ? ` <span style="color:var(--danger)">→ 新しい版 ${esc(newVersion)} があります</span>` : '（最新です）'}</p>
+      <p class="small muted" style="margin:0 0 8px">新しい機能が出てこないときは、下のボタンを押してください。保存してある画面ファイルを消して読み込み直します（予定などのデータは消えません）。</p>
+      <div class="row"><button class="btn" data-checkupdate>最新か確認する</button><button class="btn primary" data-forceupdate>最新に更新する</button></div>
+    </div>
     <h2>🗑️ ごみの日（大津市 栄町）</h2>
     <div class="box">
       <label class="check"><input type="checkbox" data-gomion ${gomiOn() ? 'checked' : ''}> カレンダーに表示する</label>
@@ -1541,6 +1575,13 @@ async function renderSettings(view) {
   bindPushSettings(view);
   bindFamilySettings(view);
   bindDeviceSettings(view);
+  $('[data-checkupdate]', view).addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = '確認中…';
+    const v = await checkUpdate();
+    toast(v ? `新しい版 ${v} があります` : 'すでに最新です');
+    renderTab();
+  });
+  $('[data-forceupdate]', view).addEventListener('click', forceUpdate);
   $('[data-gomion]', view).addEventListener('change', async (e) => { await setMeta('gomi_on', e.target.checked); toast('変更しました'); });
   $('[data-gominotify]', view).addEventListener('change', async (e) => { await setMeta('gomi_notify', e.target.checked); schedulePushSync(); toast('変更しました'); });
   $('[data-gomitime]', view).addEventListener('change', async (e) => { await setMeta('gomi_time', e.target.value); schedulePushSync(); toast('変更しました'); });
@@ -1648,6 +1689,8 @@ async function renderTab() {
     // カレンダーには出さず、「設定」タブに小さな印だけ付ける
     $('.tabbar [data-tab=settings]').classList.toggle('due', backupDue());
     view.insertAdjacentHTML('afterbegin', placeWarning());
+    view.insertAdjacentHTML('afterbegin', updateBanner());
+    $('[data-doupdate]', view)?.addEventListener('click', forceUpdate);
   } catch (err) {
     view.innerHTML = `<div class="empty">読み込みに失敗しました: ${esc(err.message)}</div>`;
   }
@@ -1700,6 +1743,7 @@ function showLock() {
 
 openStore().then(async () => {
   if (!getMeta('unlocked')) await showLock();
+  checkUpdate().then((v) => { if (v) renderTab(); }); // 新しい版が出ていたらお知らせ
   await autoClaimOwner(); // 以前から通知を使っている端末は、持ち主として自動で登録
   await refresh();
   schedulePushSync(); // 開くたびに通知の予約を最新にする（日付が進んだ分など）
